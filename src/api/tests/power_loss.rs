@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod branch_abandonment;
+mod runtime_roots;
 mod search_projection;
 
 struct Fixture {
