@@ -2802,6 +2802,13 @@ impl Database {
         }) {
             return Err(BranchLifecycleError::SourceBusy("unregistered background roots").into());
         }
+        let _checkpoint_suspension = self
+            .runtime
+            .suspend_automatic_checkpoint()
+            .map_err(BranchLifecycleError::Runtime)?;
+        // A parked automatic source is an internal snapshot, not an external
+        // reader that should indefinitely defer explicit branch reclamation.
+        self.runtime.release_suspended_checkpoint_source()?;
         self.runtime.get_mut()?.store.reclaim_branch_storage(limits)
     }
 
@@ -2835,11 +2842,14 @@ impl Database {
     pub(super) fn branch_catalog_path(&self) -> Result<PathBuf, BranchLifecycleError> {
         let root = self
             .project_root_path
-            .as_deref()
+            .clone()
             .or_else(|| {
-                self.runtime
-                    .peek()
-                    .and_then(|runtime| runtime.store.durable_root_path())
+                self.runtime.peek().and_then(|runtime| {
+                    runtime
+                        .store
+                        .durable_root_path()
+                        .map(|path| path.to_path_buf())
+                })
             })
             .ok_or(BranchLifecycleError::InMemoryDatabase)?;
         Ok(root.join(BRANCH_DIRECTORY).join(BRANCH_CATALOG_FILE))
@@ -2847,14 +2857,33 @@ impl Database {
 
     pub(super) fn current_branch(&self) -> crate::error::Result<Option<CurrentBranch>> {
         let runtime = self.runtime.get()?;
-        Ok(runtime
+        Ok(self.current_branch_from_runtime(&runtime))
+    }
+
+    pub(super) fn current_branch_from_runtime(
+        &self,
+        runtime: &super::runtime_cell::AdmittedBranchRuntime,
+    ) -> Option<CurrentBranch> {
+        runtime
             .branch_selection
             .as_ref()
             .map(|selection| CurrentBranch {
                 info: branch_info(&selection.record),
                 commit_epoch: runtime.store.commit_epoch(),
                 durability: self.durability,
-            }))
+            })
+    }
+
+    pub(super) fn branch_catalog_path_from_runtime(
+        &self,
+        runtime: &super::runtime_cell::AdmittedBranchRuntime,
+    ) -> Result<PathBuf, BranchLifecycleError> {
+        let root = self
+            .project_root_path
+            .as_deref()
+            .or_else(|| runtime.store.durable_root_path())
+            .ok_or(BranchLifecycleError::InMemoryDatabase)?;
+        Ok(root.join(BRANCH_DIRECTORY).join(BRANCH_CATALOG_FILE))
     }
 
     fn admit_branch_record(
@@ -2906,14 +2935,15 @@ impl Database {
                 storage::CatalogTransitionError::InvalidState("selection target is not ready"),
             ));
         }
-        if let Some(selection) = self
+        let current_selection = self
             .runtime
             .peek()
-            .and_then(|runtime| runtime.branch_selection.as_ref())
+            .and_then(|runtime| runtime.branch_selection.clone());
+        if let Some(selection) = current_selection
             && selection.record.id == record.id
         {
             let refresh = selection.record.metadata_revision != record.metadata_revision;
-            let runtime = self
+            let mut runtime = self
                 .runtime
                 .get_mut()
                 .map_err(BranchLifecycleError::Runtime)?;
@@ -2927,6 +2957,13 @@ impl Database {
             return Ok(());
         }
         self.ensure_branch_work_idle()?;
+        let _checkpoint_suspension = if self.runtime.peek().is_some() {
+            self.runtime
+                .suspend_automatic_checkpoint()
+                .map_err(BranchLifecycleError::Runtime)?
+        } else {
+            None
+        };
         let _resources = self
             .runtime
             .reserve_target_admission_resources()
@@ -2935,7 +2972,7 @@ impl Database {
         let (store, schema) = admitted.into_parts();
         let mut candidate = Self::new_with_config(self.config.clone());
         {
-            let runtime = candidate
+            let mut runtime = candidate
                 .runtime
                 .get_mut()
                 .map_err(BranchLifecycleError::Runtime)?;
@@ -2960,7 +2997,7 @@ impl Database {
             .apply_engine_system_schema()
             .map_err(BranchLifecycleError::storage)?;
         {
-            let runtime = candidate
+            let mut runtime = candidate
                 .runtime
                 .get_mut()
                 .map_err(BranchLifecycleError::Runtime)?;
@@ -2976,6 +3013,14 @@ impl Database {
         }
         // Replace only after complete candidate validation. Old snapshots own
         // their schema/store/pins; completed jobs remain on the host handle.
+        candidate
+            .runtime
+            .arm_automatic(
+                &candidate.config,
+                candidate.local_qos_scheduler.clone(),
+                candidate.runtime_governor.clone(),
+            )
+            .map_err(BranchLifecycleError::Runtime)?;
         self.runtime = candidate.runtime;
         Ok(())
     }
@@ -3408,6 +3453,13 @@ impl Database {
         }
         let parent_id = parent.id;
         let parent_head_path = self.branch_head_path(parent_id.as_uuid())?;
+        let _checkpoint_suspension = if self.runtime.peek().is_some() {
+            self.runtime
+                .suspend_automatic_checkpoint()
+                .map_err(BranchLifecycleError::Runtime)?
+        } else {
+            None
+        };
         let sealed_source = if self.runtime.peek().is_some_and(|runtime| {
             runtime
                 .store

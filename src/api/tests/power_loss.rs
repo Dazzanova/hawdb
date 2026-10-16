@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod automatic_checkpoint;
 mod branch_abandonment;
 mod runtime_roots;
 mod search_projection;
