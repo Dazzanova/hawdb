@@ -2156,10 +2156,8 @@ impl SearchOutOfCoreReader {
                     .max_matched_spans
                     .get()
                     .saturating_sub(matched_span_count),
-                self.config
-                    .max_matched_span_bytes
-                    .get()
-                    .saturating_sub(matched_span_bytes),
+                self.config.max_matched_span_bytes.get(),
+                matched_span_bytes,
             )?;
             matched_span_count = matched_span_count.saturating_add(matched_spans.len());
             matched_span_bytes = matched_span_bytes.saturating_add(
@@ -2273,7 +2271,7 @@ impl SearchOutOfCoreReader {
                 &self.config,
                 segment,
                 &ids,
-                self.config.max_hydrated_bytes.get() - hydrated_bytes,
+                hydrated_bytes,
                 metrics,
             )? {
                 hydrated_bytes = hydrated_bytes
@@ -2281,6 +2279,8 @@ impl SearchOutOfCoreReader {
                     .ok_or_else(|| {
                         HawDBError::Storage(format!("search {operation} byte count overflow"))
                     })?;
+                // Selected decoding already enforces this cap; retain the
+                // aggregate check as a consistency guard for that accounting.
                 if hydrated_bytes > self.config.max_hydrated_bytes.get() {
                     return Err(HawDBError::Storage(format!(
                         "search {operation} requires {hydrated_bytes} bytes, exceeding {}",
@@ -4188,6 +4188,8 @@ mod tests {
     #[cfg(feature = "full-text-search")]
     mod candidate_budget;
     #[cfg(feature = "full-text-search")]
+    mod span_budget;
+    #[cfg(feature = "full-text-search")]
     mod text_seed;
 
     use super::*;
@@ -4618,6 +4620,11 @@ mod tests {
             .search_with_options("graph", None, SearchMode::Text, options(1, None))
             .unwrap_err();
         assert!(error.to_string().contains("search hydration requires"));
+        assert!(matches!(
+            error,
+            HawDBError::ResourceBudgetExceeded(details)
+                if details.budget_option == "SearchOutOfCoreConfig.max_hydrated_bytes"
+        ));
 
         let span_config = SearchOutOfCoreConfig {
             max_matched_spans: NonZeroUsize::new(1).unwrap(),
