@@ -257,6 +257,15 @@ index, canonical commit, conflict and durable reopen tests. Churn, long-pin RSS
 and cleanup-latency qualification remain open, including future per-value and
 relational-prefix collectors.
 
+`Database::read_dependency_validation_failures` exposes process-lifetime,
+per-instance counts of rejected validation calls. Conflict counters distinguish
+`ReadBarrier`, `Database`, node domain, exact identity and `Schema` keys;
+source-change, refused-capture and unavailable-source errors have separate
+counters. Successful validations do not increment them. Counts reset on reopen,
+and concurrent field reads need not represent one atomic instant. Hosts can
+compare consecutive reports to detect repeated fallback invalidation before
+depending on long-running preparation for liveness.
+
 The collector regression
 `randomized_node_dependency_validation_preserves_query_results` exercises a
 fixed-seed matrix of label scans, indexed seeks, counts and empty results against
