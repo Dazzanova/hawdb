@@ -7,7 +7,7 @@ use std::cell::RefCell;
 #[cfg(feature = "test-support")]
 use std::rc::Rc;
 
-fn ledger(root: &Path) -> serde_json::Value {
+pub(super) fn ledger(root: &Path) -> serde_json::Value {
     let bytes = std::fs::read(root.join("consumer-allocations.hawdb")).unwrap();
     let start = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
     serde_json::from_slice(&bytes[start..bytes.len() - 4]).unwrap()
@@ -294,7 +294,7 @@ fn registered_stationary_metadata_reservation_reuses_identity_after_lost_reply()
 type DescriptorBlockers = Rc<RefCell<Vec<fs::File>>>;
 
 #[cfg(feature = "test-support")]
-fn with_ledger_descriptor_refusal<T>(
+pub(super) fn with_ledger_descriptor_refusal<T>(
     db: &mut Database,
     root: &Path,
     predicate: impl Fn(&serde_json::Value) -> bool + 'static,
