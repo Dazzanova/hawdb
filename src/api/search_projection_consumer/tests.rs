@@ -1302,3 +1302,5 @@ fn legacy_registered_prefix_1043_refuses_before_hydration_and_reopens_complete_r
 }
 
 mod stationary;
+
+mod reclamation;
