@@ -155,8 +155,9 @@ impl PhysicalPlan {
                 scan.mode.filter_position(),
                 scan.variable, scan.distance_column, scan.node_visibility_predicate, scan.eligible_variable, scan.max_work,
             ),
-            PhysicalPlan::TextSeedScan { query_parameter, top_k, output_external_id, metadata_filters, resource_profile } => format!(
-                "{pad}TextSeedScan query=${query_parameter} top_k={top_k} output_external_id={output_external_id} metadata_filter_fields={:?} priority={} max_parallelism={} max_working_memory_bytes={:?}",
+            PhysicalPlan::TextSeedScan { query_parameter, top_k, complete, output_external_id, metadata_filters, resource_profile } => format!(
+                "{pad}TextSeedScan query=${query_parameter} {} output_external_id={output_external_id} metadata_filter_fields={:?} priority={} max_parallelism={} max_working_memory_bytes={:?}",
+                if *complete { format!("max_candidates={top_k} complete=true") } else { format!("top_k={top_k}") },
                 metadata_filters.keys().collect::<Vec<_>>(), resource_profile.priority,
                 resource_profile.max_parallelism, resource_profile.max_working_memory_bytes),
             PhysicalPlan::VectorSeedScan {
