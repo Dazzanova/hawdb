@@ -6,6 +6,228 @@ authoritative; this is a map of test families, not an exhaustive list of every
 Rust test function. Update it when changing a family's scope, build profile,
 execution lane, fixture size, isolation or known failure mode.
 
+The `api::query_request::tests` unit family covers compact request collection
+through the ordinary read-transaction API. The 2,048-row collection regression
+compares rows and payload accounting with validated consumer delivery, checks
+owned-result completion/peak charges, rejects row and payload overflows, and
+reuses the snapshot after refusal. Existing scoring, access-control, EXPLAIN,
+and cancellation cases exercise the same compact collector. Mem bounded read
+snapshots use this collector and retain cumulative statement budgets.
+
+`api::tests::knowledge_entity_deletes` retains its six deletion scenarios through
+ordinary parameterized requests: incident edges, scoped nonmatches, idless
+identity, invalid syntax, read-only refusal and WAL replay. It no longer uses
+single-entity deletion adapters or their DTOs. `graph_route_evidence` and
+`workload_fixtures` retain private route statement qualification, while the
+readiness crate tests its generic reducer with a small parameterized statement.
+These remain in their existing root/readiness CI owners; the weekly native
+runtime lane also selects the deletion and route-evidence families.
+
+`api::tests::{community_assignments,community_cleanup}` retain their seven
+scenarios through bounded ordinary Cypher: scoped and global NULL assignment,
+invalid syntax before WAL, preservation of other labels, detach/incident-edge
+deletion, empty no-op, one-batch durability and reopen. They use query rows and
+commit epochs instead of removed business response DTOs. Their existing root
+general unit owner remains unchanged.
+
+`api::dependency_read::tests` checks both Cypher and SQL source mappings under
+zero, undersized and sufficient result reservations, plus cancellation and
+failed-proof refusal. Consumer catch-up admits result memory separately from
+publication working memory. The registered Consumer integration cases in
+`mvcc_staging_session` exercise graph/SQL delta and full-source verification,
+rebuild, reopen and released admission, including the native Windows lane.
+Standalone staging/baseline fixtures explicitly reserve results too; a zero
+reservation remains a refusal. Request parity also checks explicit zero SQL
+payload limits. CI owns these regressions; the weekly native runtime lane
+explicitly selects the prepared-source reservation/cancellation case.
+
+`api::sql_runtime::tests` passes prepared SQL mutations through the database and
+transaction kernels with diagnostic-only text, detecting accidental parser
+fallback. DDL, INSERT/RETURNING, UPDATE, DELETE and Strict Append preserve bound
+parameters, output refusal, earlier transaction work and publication. Root
+general and the native runtime lane own these cases. The relational crate's
+prepared-mutation cases rebind current schemas/parameters and append routing;
+its existing manual statement compiler campaign reuses templates across inputs
+and compares independent typed writes. No new fuzz CI owner is introduced.
+
+`hawdb-sql::template_cache::tests` keeps branch-catalog inspection out of the
+selected branch's data-query cache without reparsing its returned template.
+The SQL crate unit owner covers eviction/hit behavior; the existing root recovery
+`branch_lifecycle` family preserves the ordinary database cache-isolation check.
+
+The executor `result_delivery::tests::borrowed` family checks native columnar
+payload pointer identity for immediate consumers, compact validated delivery
+across source retirement and segment boundaries, logical quota refusal before
+callbacks, cancellation/error/unwind release, schema rejection and nested-copy
+admission independent of source spare capacity. The executor unit owner runs
+these regressions in CI. Root `api::tests::query_execution` checks the public
+borrowed streaming entrypoint's compact views and zero-prefix budget refusal.
+The weekly native runtime lane also selects these borrowed-result cases on
+Windows and macOS. These do not yet qualify a native scan-to-consumer production
+path.
+
+The `api::query_request::adapter_tests` family exercises shared Cypher and SQL
+requests across database, pinned-read, explicit-write, concurrent optimistic and
+pessimistic, and Embedded transaction paths. Cases include parameters, scoring,
+ACL availability, zero/output limits, parent/request cancellation, prepared-policy
+invalidation, SQL RETURNING and Cypher SET RETURN refusal before private staging
+or publication. A changed ACL requires fresh preparation; a missing ACL capability
+retains its typed error. Branch-switch cases retain the distinct branch error.
+Cypher cases retain earlier successful statements through refused
+updates in both locking modes, enforce exact/zero row and payload limits, and
+distinguish aggregate result size from affected-node count and zero matches.
+Persistent coverage reopens a database after refused SET RETURN statements and
+checks that only successful transaction statements survived. The executor
+mutation-preflight owner independently proves output refusal precedes any storage
+write call.
+The production qualification fixture counts separate preparation/execution
+admissions. Its small mixed soak funds both phases and bounded stream buffers
+with 3 MiB, retains a raw dataset twice that size (768 nodes, 8 KiB payloads),
+and preserves the 32 KiB blocking-operator/64 KiB segment-cache limits, complete
+query counts, checkpoint advancement and final zero-admission assertions.
+`api::query_request::host::tests` also covers host-scorer delivery through the
+concurrent and transaction entry points. These remain root-unit regressions;
+the weekly platform runtime lane exercises the request families with ACL enabled
+and disabled. Core cancellation tests cover linked cancellation/waker cleanup,
+controller preservation and common-ancestor work accounting in that lane.
+
+`api::query_request::budget_tests` exercises one mixed Cypher/SQL read budget
+while concurrent writes advance, rejects cumulative row/payload overflow without
+debiting failed owned results, and charges EXPLAIN's delivered report. These
+cases share the request family's root-unit and weekly platform owners.
+`embedded_tokio::request_tests` covers owned request attachments, ACL enabled
+and disabled, host-scorer invocation/disposal, streaming ceilings, cancellation,
+admitted SQL template reuse with rebound parameters, SQL/Cypher RETURNING rejection
+before commit with unchanged epochs and refunded admission, and refusal while an
+explicit Embedded transaction is open. The weekly
+runtime lane runs the complete Tokio family with `tokio-runtime`, then these
+request cases with `tokio-runtime,acl`. Its saturated-admission case also proves
+SQL waits for capacity before parsing. Native CI owns execution; local strict
+Clippy checks compile the same test sources.
+
+`nowledge_mem::concurrent_owner::tests` requires a second writer to commit while
+the first transaction callback remains suspended, then checks both the retained
+old snapshot and the newly published state and released admission memory. It
+uses the existing App snapshot fixture and root general unit owner.
+The weekly native runtime lane also runs this family and
+`nowledge_mem::app_read_snapshot_tests`, preserving their mixed-statement,
+publication-failure, unwind, admission and old-generation assertions after Mem
+switches to the concurrent transaction kernel.
+
+`api::concurrent::graph_preparation_tests` compares actual planner bypass counts
+with pessimistic execution/replay counters. One statement prepares once even when
+new locks require two executions; the next statement rebinds its parameters and
+uses the staged schema. Refused output restores the statement without dropping
+earlier writes or their locks. This is owned by the root general unit suite and
+the macOS/Windows runtime lane. Existing request, lock and serializability
+families continue to cover the shared execution kernel; preparation counts are
+not latency or allocation measurements.
+
+`api::concurrent::autocommit::tests` covers ordinary Cypher writers sharing a
+label but updating distinct unique keys, readers progressing while private
+execution is suspended, intervening commits without replanning, excluded unique
+candidates, schema invalidation, cancellation/output refusal, and durable create
+IDs after reopen. The root concurrent suite and macOS/Windows runtime lane own these
+cases, along with out-of-core unique lookup, EXPLAIN ANALYZE rejection, mutation
+summary ceilings and expression/NULL predicate parity.
+The expression fallback uses a supported `COALESCE` comparison. The concurrent
+read-observation cases pause SQL and Cypher private execution before publication;
+post-commit telemetry is not a prepublication synchronization point.
+`nowledge_mem::read_execution::tests` additionally exercises the actual
+admitted report adapter with two such writers, captured plans, one preparation
+per statement and full admission refund. These are correctness/operation-count
+checks, not release latency or allocation evidence.
+
+`embedded_tokio::concurrency_tests` covers both ordinary languages with two
+writers and advancing readers, preparation reuse across intervening commits,
+direct-host mutation exclusion, database replacement refusal, cancellation and
+complete admission refund. It uses the same concurrent kernel phase gates as the
+facade regressions. Root Tokio and the existing macOS/Windows Tokio-entrypoint
+lane own this family; these are correctness checks, not release benchmarks.
+Planning regressions now test compatibility across data/checkpoint changes,
+configuration refusal and durable execution/reopen rather than the retired
+whole-publication equality fence. Existing explicit transaction fences remain.
+
+`api::concurrent::autocommit::sql::tests` covers two ordinary SQL point writers
+and advancing readers, old publication release before lock waiting, fresh-snapshot
+arithmetic, changed constraint scopes, excluded predicate candidates versus
+explicit writers, independent table inserts with UUID defaults, FK cascades,
+RETURNING refusal, precommit cancellation and durable reopen. Prepared DDL/Strict
+Append execution receives diagnostic-only text to detect parser fallback. The
+root concurrent unit suite and an exact required macOS/Windows runtime filter own
+these cases. Existing explicit-transaction stale-snapshot tests remain unchanged.
+These assertions establish scope/ownership behavior, not release speedup.
+
+`HawDBAutocommitScope` joins the existing `docs/tla:storage_models` positive
+owner. Its three manual controls (`UnprotectedPredicate`, `EarlySnapshot`,
+`IgnoreSchema`) distinguish predicate protection, snapshot ordering and admission
+invalidation. They do not replace positive checking or native scope-mapping tests.
+
+`nowledge_mem::read_execution::tests` covers ordinary owned/streaming and report
+reads from published views: streaming and report-observation callbacks must allow
+a writer and fresh reader to finish, and execution-admission telemetry must
+release the preparation view in both ordinary and report entrypoints.
+Data-only commits remain reusable; schema and database-instance changes reject
+the old preparation before execution. Every case checks released admission
+memory. Report cases also require one cache lookup per preparation and preserve
+physical-plan capture with rebound parameters. External text/vector seed reports
+admit the published projection's I/O depth without retaining its generation while
+waiting; graph-only reports and plain EXPLAIN do not reserve projection I/O.
+A projection I/O-depth change during admission rejects the old request and
+releases its preparation, execution memory and I/O reservations.
+The root general unit owner and weekly runtime lane execute this family.
+Production resource-profile cases in the same family require completion while
+the publication owner is held, live cache observations with the original durable
+and manifest metadata, one preparation, host/statement ceilings and full refund
+after refusal. Admission telemetry advances data, schema or the database instance;
+profiling releases its preparation view and rejects stale evidence against the
+execution epoch. `store::tests::detached_snapshots_preserve_live_cache_and_captured_manifest_observations`
+additionally checks nested snapshots after their writable owner closes. These
+observations are shared cache/process metrics, not per-query concurrency attribution.
+The family also checks schema guidance and generated queries against the last
+published view while a direct writer holds the owner. Generated reads use one
+preparation lookup, retain parameter/row/payload checks, and reject a stale
+generated context after an ordinary data commit during admission. Plain EXPLAIN
+observation covers read, DML and DDL plans while a writer and fresh reader finish.
+Generated parameter rejection uses an explicitly typed `Thread.id` property; an
+undeclared `Any` property correctly accepts integers. Both admitted generated-read
+entrypoints reject invalid parameters before preparation and leave the plan-cache
+counters unchanged; snapshot epoch validation still occurs at execution.
+EXPLAIN observation uses a
+separate 64 KiB host result budget for retained plan/schema metadata; ordinary
+App reads keep 16 KiB. Failed observations surface the original query error
+after releasing the waiting writer, without panicking inside telemetry.
+`api::query_runtime::tests` checks that plain EXPLAIN never executes write plans,
+ANALYZE rejects DML/DDL, zero diagnostic budgets fail, and direct/forked read
+snapshots retain captured query settings with statement-local overrides. These
+tests use the existing root general and weekly runtime owners and features.
+Small logical-payload cases preserve successful bounded reads and typed payload
+refusals while separately testing a stricter caller result-memory reservation and
+zero delivery on refusal. Governor counters include both preparation and execution
+admissions, with complete release after each statement.
+
+The App snapshot family also exercises out-of-core generation replacement through
+the actual Mem maintenance entrypoint while a snapshot callback remains active.
+It checks the old graph/projection pair, the newer pair, generation advancement,
+release of the old reader after callback completion, and refunded admission.
+The FD-pressure retry case holds descriptor reservations on another thread so
+refresh cannot borrow them; it checks the old pinned reader and same-handle retry.
+This covers `SearchOutOfCoreReader::refresh_shared` through its embedded host;
+the resident fixture now applies three graph/projection updates while an old
+snapshot remains active and checks fresh/old pairs plus final refund. Resident
+report-observation tests cover ordinary and external text queries while a writer
+and a fresh reader advance. Search resident-generation units cover shared funding,
+capacity refusal/retry, last-owner release and frozen freshness in query reports.
+The existing Search feature matrix and root runtime lanes own these cases.
+The resident text-seed fixture requires the graph, SQL and projection writer to
+finish before the retained snapshot callback returns, then verifies its old
+results and epoch remain stable. Incremental out-of-core helper fixtures submit
+documents in the generation writer's required strictly increasing ID order.
+The text-seed fixture also exercises the report entrypoint and EXPLAIN ANALYZE
+with the captured out-of-core external operator. Plain/analyzed explain rows
+have an explicit 1 MiB diagnostic cap and debit their delivered row/payload from
+the cumulative snapshot ledger; ordinary reads keep their 8 KiB snapshot cap.
+
 ## Execution lanes
 
 | Lane / entry point | Problems covered | Execution policy |
@@ -44,13 +266,15 @@ execution lane, fixture size, isolation or known failure mode.
 | Storage WAL admission (`store::durable::wal::tests`) | Healthy mutation admission avoids generation-directory inventory; refusal retains exact pressure measurements and reasons | Existing `//crates/storage:hawdb_storage_tests` / Prow crates owner. Two pure cases cover lazy observation and 1,536 pressure combinations, including integrity, WAL/delta, free-space, cache and retained-reader states. Public pressure reports and durability/namespace checks retain their existing owners. |
 | Storage source-sync and captured-WAL units | Non-strict source-barrier progress versus uncertain durability failure | Source barriers complete under strict foreground descriptor pressure without losing the live handle; captured WAL append prepays native validation handles before writing even when a competing owner fills remaining capacity. The latter also executes explicitly in the native Windows contract lane. |
 | Storage WAL identity-cache and source-directory namespace units | Reuse pinned descriptor identity while preserving fresh namespace lookup, rotation, symlink retargeting and strict admission | Existing storage unit owner. Unix-only cache coverage complements captured-WAL replacement, uncertain append, rollback and power-loss tests; Windows keeps the existing native identity path. |
+| Private checkpoint WAL resume and verbatim suffix fixtures | Partial append rollback through the original native object, completed-prefix retry, exact payload preservation and independent reopen | Existing storage unit and weekly Windows/macOS storage lanes. Windows rollback verifies that recovery handles can exceed the foreground FD ceiling while remaining accounted. Independent test copies exclude the source's active ownership-lock sidecar. |
+| Search generation cleanup captured-source units | Relative enumeration/unlink preserve foreign replacement files; both sweeps reject foreign retention without losing retries | Existing search unit and vector platform feature lanes. Windows replaces the path after native directory capture and before opening child locks; Unix also replaces it after publication/source binding. Both require an actual replacement and preserve all deletion/retention assertions; native ancestor-rename refusal is separately covered by storage source-directory units. |
 | Storage `file_descriptors::tests::capacity_policy` and root `api::tests::descriptor_capacity` | Soft capacity with pinned readers, strict foreground refusal, non-strict internal progress, joined-worker policy handoff and accounting retirement | Existing storage/root checked-profile owners; deterministic small fixtures. Refusal cases explicitly select strict mode. Both project constructors and the database facade preserve typed strict/soft configuration conflicts, the active policy and counts; a policy can change after all previous owners close. The existing compat protocol-server unit lane round-trips both policy-conflict directions and rejects non-boolean fields. Unix subprocesses lower only their own soft limit to verify the shared process OS allowance across three project domains, namespace/standalone accounting, active/retired prepaid-slot ownership, atomic final-slot admission by competing projects, failed-open retirement, typed pre-effect refusal, unchanged WAL bytes, same-handle retry and reopen; native exhaustion remains a separate Linux test. The default full-budget reservation test also uses an isolated Unix process so it cannot consume another test's process allowance. Namespace-probe fixtures verify independent-project and alias isolation, initializing standard-library OS error formatting before measuring exact native handle retirement on every iteration. Native Bindings `windows-native-contracts` runs the complete descriptor family and facade capacity tests, records source/toolchain and retains output; native Windows execution remains distinct from cross-compilation. Metadata/bootstrap, ownership-lock, sidecar publication, source synchronization, change capture and search/initializer cleanup regressions cover internal progress or native failure retirement at occupied strict capacity. Change capture retains its preimage byte limits and complete replay assertions. See [descriptor capacity](FILE_DESCRIPTOR_CAPACITY.md). |
 | Default/minimal/graph-text consumer, host allocator and portable tests | Public feature boundaries, allocator ownership, in-memory portability and excluded native dependencies | Do not replace exact minimal-feature compilation with a default-feature run. |
 | Scoped Consumer preparation (`cargo test --locked -p hawdb --all-features --test mvcc_staging_session registered_consumer_`) | Real writer commits between capture, reservation, construction and selection; repeated durable watermarks; graph/SQL/schema/source fences; reserved/prepared drop recovery and cold reopen | Root integration lane owns the tests. The split API is described in [Consumer progress and retention](CONSUMER_PROGRESS_AND_RETENTION.md); manual `consumer_publication` timing also records commits during native construction. |
 | Read-only conflict history (`cargo test --locked -p hawdb-storage --lib snapshot_retention_tests`) | Long readers release unrelated stamps; stale read-to-write upgrades fail closed; writable savepoints preserve delete/reinsert conflicts; snapshot allocation accounting | Storage unit lane owns the tests. Read data and dependency/write validation pins have separate lifetimes. |
 | Cross-crate FD refusal and owned cleanup (`spill::tests`, relational `descriptor_exhaustion`, vector `artifact::descriptor_tests`, Search descriptor/root-registry/stage-cleanup families, storage control-candidate and root derived-repair units) | Strict foreground rejection versus internal progress, native cleanup failure, lock custody and exact retry | Existing crate/root checked-profile CI owners and the complete Search feature matrix. Foreground refusal fixtures explicitly select strict mode, and repair metadata/database owners share that policy. Pressure loops stop at the configured target rather than running to OS exhaustion. Abandoned projection writers, private stages, stationary producers and publication locks must progress at occupied strict capacity while preserving pinned readers and peer exclusion. Captured publication leases use bounded directory duplicates, preserve foreign lock-path evidence on native failure, release failed registration, and retry under strict pressure; background-only/vector-only matrices must not use native process exhaustion as the fixture. Directory blockers or injected native unlink failures retain cleanup debt, bytes, host charges and retry dispositions; cancellation/memory refusal and root-alias/foreign-root registry isolation remain covered. Native Windows selects storage control-candidate, stationary Consumer and captured-publication lease families explicitly; the lease cases reuse the existing all-feature Search test binary and retain their own evidence file. No feature matrix, fixture, assertion budget or timeout is reduced. |
 | Consumer physical reclamation (`cargo test --locked -p hawdb --all-features --lib consumer_reclamation`) | Old snapshot and initial-lease protection, durable branch and pending-operation roots, bounded retries, unknown-evidence retention, FD/memory release and ledger retirement before unlink | Seven lifecycle cases belong to the root unit lane, including cleanup and retry at occupied strict foreground FD capacity; one recorder case belongs to the power-loss family. The recorder fixture and database opens explicitly share the strict 32-descriptor configuration. The Windows native contract lane selects all eight explicitly. The recorder explores lost/torn/reordered uncovered writes at the first unlink; close/reopen fixtures cover partial retirement but do not qualify the complete platform power-loss matrix. See [cleanup ownership](SEARCH_CLEANUP_OWNERSHIP.md). |
-| Publication-owner admission (`api::publication::tests`) | A waiting admitted reader precedes later writers, an admitted writer precedes later readers, and reader callbacks remain concurrent | Existing root unit lane, ordinary profile. Channel-controlled cases inspect only the private acquisition gate; they do not claim platform-wide FIFO fairness. Validation/publication exclusion and error/retry tests retain their existing ownership. No additional CI job. |
+| Publication-owner admission (`api::publication::tests`) | A waiting admitted reader precedes later writers, an admitted writer precedes later readers, reader callbacks remain concurrent, and nonblocking writers honor the gate, retry after release and reject poisoned admission | Existing root unit lane, ordinary profile. Channel-controlled cases inspect only the private acquisition gate; they do not claim platform-wide FIFO fairness. Validation/publication exclusion and error/retry tests retain their existing ownership. No additional CI job. |
 | Registered covered-token reclamation (`registered_consumer_reclamation_preserves_continuously_invalidated_covered_base`) and manual `consumer_publication` benchmark | Actual post-E writer commits while preparation is paused, typed refusal and retained base during GC; outer publication-owner latency and watermark progress under 1/4/8 writers | Regression: default/minimal `mvcc_staging_session` and native Windows registered selection. Benchmark: manual only, repository bench profile, disabled/legacy/covered/scoped-blocking/detached controls and raw p95/p99 samples. The opt-in `--sustained true` detached workload continues publication until writers finish or its explicit attempt ceiling, with checkpoints every 16,384 foreground writes and retained checkpoint samples. Its finite-progress qualification is separate from latency controls and the original strict writer gate. Manual `python3 scripts/measure-consumer-publication.test.py` checks executable/profile matching and actual feature provenance; no default CI registration. The separate opt-in `--with-readers` driver cohort adds one pinned canonical reader per writer and phase-boundary Linux process RSS/high-water/CPU-tick/I/O observations. It checks every document identity/content and retains per-request owner wait and preparation-overlap intervals. Missing resources, zero reads or drain-only reads cannot qualify; process high-water marks do not prove phase heap ownership. Reader measurement remains manual and does not change the completed writer-only cohorts. Whole-Database post-E dependencies retain conservative refusals; Domains-scoped finite progress is qualified separately. The helper records intake/mapping call counts with a `2 * feed.items + 1` host bound for its Done-only/no-delta mapper, without changing feed/mapping resources. A 60,000-update manual regression exercises complete coverage and native publication past the old 100,000-call bound; no new CI job. Quiescent drains are not sustained progress. [Workload and qualification boundaries](CONSUMER_PUBLICATION_QUALIFICATION.md). |
 | `//:hawdb_system_sql_loom_tests` | Bounded modeled system-table publication interleavings | Model exploration; not a wall-clock fuzz campaign. |
 | Package parity, query-limit inventory and root-partition script tests | Missing package ownership, unbudgeted query routes, duplicate or omitted test partition selection | Keep these structural checks when moving targets. |
@@ -151,6 +375,41 @@ vector_only, background_only, text_vector, text_background and vector_background
 | `hawdb_search_streamed_lifecycle_tests` and FTS profile variants | 32-MiB streamed bodies through projection update, replay, compaction/retraction and budget refusal | Five complete FTS feature profiles. Reuse the same feature-profile library; compilation is uniform across the repo. |
 | Allocation-specific integration targets | Identifier, descriptor, segment, analyzer and related allocation accounting | Uses the same repository profile; preserve measurement assumptions and compare allocation evidence after profile changes. |
 
+Weekly platform steps use Bash's fail-fast execution on every OS, including
+Windows, so an earlier failing native command cannot be hidden by a later
+successful test command. The explicit PowerShell artifact collector remains
+an override. A green legacy Windows job with failed tests in its log is not
+passing qualification evidence.
+
+Resident generation cases in the existing Search unit/feature matrix cover
+ordered COW ranges, writer progress with an old read view, body ownership after
+deletion, retained key/directory capacity, and old/new payload reads across
+checkpoint replacement. The text-enabled case requires physical range reads,
+checks old/new freshness, and checks final descriptor refund. The strict FD
+fixture now verifies that an already pinned read succeeds at capacity while a
+new generation open refuses with the typed cause and retries after release.
+Storage's existing range-reader family independently replaces and removes the
+pathname before the first captured read, retains digest rejection and checks
+final clone release. These use the existing native Search/Storage CI lanes;
+no local duplicate runtime execution or adapter lock/performance acceptance is
+implied. Local replay filters are `resident_documents::`, `resident_snapshot::`
+and `scan::reader::tests::captured_file_` in their owning Cargo packages.
+
+The power-loss publication fixtures select actual temporary manifest writes by
+filename prefix, preserving after-write, before/after-rename and torn/reordered
+fault schedules for both ordinary and partitioned mutations. Validation scratch
+written by later cleanup must not replace the observed publication boundary.
+The storage model unit family checks that this filter preserves path scope,
+skip/last selection and pre-sync torn bytes despite later writes and barriers.
+The branch-GC fixture checks balanced descriptor ownership after runtime closure
+and uses reservation pressure to evict the model-owned idle file cache before
+asserting return to the original native-root charge. Internal recovery/cleanup
+may exceed the strict foreground target. Search-ancestry refusal/retry reserves
+the remaining capacity after that root charge: this standalone writer synchronizes
+ancestors serially, refuses with zero free slots and retries with one. Governed
+Consumer staging uses its separate captured-directory inventory.
+These remain existing storage/root and native branch-power-loss CI families.
+
 ### Standalone Search writer I/O waves
 
 The existing Search crate unit target owns
@@ -174,6 +433,17 @@ artifact build/publication. Replay with `cargo test --locked -p hawdb-search
 No CI lane/profile/timeout/fixture scope changes. See [the admission contract](SEARCH_WRITER_IO_ADMISSION.md).
 
 ## CI benchmark smoke owners
+
+Native numeric result delivery is covered by the executor `numeric::` family
+and the facade's query-execution family. The deterministic native oracle covers
+row, lending, owned-typed and columnar-morsel inputs, scalar/NULL values, output
+ceilings, stop and error. Ownership cases verify source/literal pointer identity,
+duplicate aliases, schema refusal, cancellation and panic cleanup. The existing
+parallel resource-refusal case exercises both binding and native sinks. The
+facade case checks compact owned parity, immediate native versus validated
+compact callbacks, fail-closed row/payload limits and SKIP/LIMIT. The native
+Runtime Platform lane selects these cases; the ignored long campaign remains
+local-only. Report-value tests include the native projection counter.
 
 The local-only `mixed_point_growth` probe additionally separates plain EXPLAIN,
 EXPLAIN ANALYZE, no diagnostic, and their original combined sequence. Full and
@@ -358,6 +628,21 @@ relationship to an out-of-scope label whose post-E mutation must invalidate
 publication. Storage units check immutable reservation predecessors, missing
 registration policy, and direct history pruning without staging compaction.
 
+### Prepared query admission reuse
+
+The runtime retained-memory tests cover fixed-reservation transfer, exact capacity,
+shared process accounting, non-retryable self-wait refusal, and changed capacity.
+`hawdb-runtime-tokio` tests cover single-CPU preparation/execution, queued future
+drop and cancellation, and failed/panicking preparation. API runtime tests check
+schema, branch and configuration revalidation and verify that a prepared object
+does not retain a reader pin. Embedded template-cache tests require one lookup per
+request, including disabled caches and non-deterministic bypasses. The
+`HawDBPreparedAdmission` model and four negative controls cover the ownership
+transition independently of query execution. Two manual reachability controls
+also witness hard-refusal recovery after releasing preparation and a final
+refusal when execution alone still exceeds capacity. The positive model remains
+in the existing TLA suite; native capacity-band tests own Tokio waiter renewal.
+
 ## PR #1217 root CI scheduling
 
 - `//:hawdb_unit_checkpoint_headroom_tests` owns the complete
@@ -416,6 +701,181 @@ cases with the selected 1/2/4/8-thread setting. No fuzz campaign is added.
   These are preparation timings without WAL synchronization, not committed
   throughput or durable p99 measurements.
 
+### Resident read leases
+
+`HawDBResidentReadLease` covers atomic graph/projection capture after execution
+admission, shared generation charges, refusal, release-before-refund and continued
+publication while readers retain old generations. The storage-model CI suite owns
+the positive model. Its manual-only `TornPair`, `UnchargedRead`, `PinnedWait` and
+`EarlyRefund` controls must each violate the intended invariant. Native snapshot
+and report tests above establish the host correspondence; the finite model does
+not establish allocator capacity bounds or throughput.
+
+The existing Mem `app_read_snapshot_tests` and `read_execution` runtime lanes
+also cover detached candidate search, hydration and retrieval: resident and
+out-of-core readers keep the old graph/projection pair while writer publication
+and fresh public helpers advance; admission callbacks retire old publications,
+accept data updates and reject changed I/O requirements. Retrieval checks zero
+admitted working/result ceilings and a successful bounded control. Report
+observation checks both `match_return` and `text_graph_search` event kinds and
+preserves worker errors separately from a missing callback or timeout.
+
+### Windows power-loss partitions
+
+The weekly Branch Power Loss lane runs each of the four automatic checkpoint cut
+families in a separate Windows job, plus a disjoint remainder. Linux/macOS retain
+the full suite. `scripts/branch-power-loss-shard.py` derives selected tests from
+Cargo's actual discovery and rejects missing/new automatic families, duplicates,
+empty partitions or an incomplete union. Each artifact records complete discovery,
+all partition membership and the selected test names. Recorder and configuration
+checks remain in every Windows job; all fault schedules, assertions, features,
+checked-profile settings, `--test-threads=1` isolation and 120-minute job ceilings
+are unchanged. This trades repeated build/setup cost for completing independent
+fault groups before the job ceiling. Source `83eab403` run 39959116101 stopped
+inside the automatic manifest case at 120 minutes; that is incomplete coverage,
+not a 120-minute fuzz campaign. Final-source runtime durations remain required.
+
+`//:power_loss_partition_script_test` and the platform job's preflight check
+exercise actual selector output under simulated Windows default CRLF translation,
+then interpret LF-delimited arguments as Bash does. Control files explicitly use
+LF so filters and `--exact`/`--skip` reach libtest unchanged. The test also rejects
+duplicate, missing, unexpected and empty discovery. It locates the selector through
+Bazel runfiles when the test launcher is renamed, preserving direct Python usage.
+Candidate `92681f67` exposed
+this transport bug before the selected qualification cases could start; those
+failed jobs are not recovery-test results.
+Manual dispatch with `scope=power-loss` runs the same complete power-loss
+platform matrix in a separate concurrency group, preserving an ongoing full run.
+`scope=runtime` selects both runtime platforms in another independent group for
+query/adapter changes. Partial runs do not qualify their skipped lanes.
+Scheduled and default `scope=all` manual runs continue to include every lane.
+
+### Parameterized PageRank persistence
+
+`api::tests::pagerank` exercises score updates and clearing through bounded
+parameterized Cypher in explicit transactions. The root general unit owner
+retains first-duplicate input normalization, missing IDs, preservation of
+projected entities without external IDs, null clearing, exact commit epochs,
+one WAL batch and reopen values. Its input-normalization fixture validates the
+whole input before opening a transaction, including invalid scores and labels;
+it performs no graph reads or mutations. The old PageRank CRUD methods, helpers
+and response/request DTOs are removed from test builds as well as production.
+These runtime regressions remain CI-owned; local strict Clippy compiles them.
+
+
+## Mem adapter concurrency qualification
+
+The manual `mem_query_concurrency` Cargo/Bazel benchmark exercises the ordinary
+Mem handle with multiple report writers and point, report or streaming readers.
+It retains per-call intervals, acknowledgement observations, errors, actual
+runtime CPU/cgroup limits and residency, and verifies successful writes after
+reopen under default synchronous durability. Its optional sustained-reader mode
+keeps readers active until every fixed-work writer finishes, with the original
+reader iteration count as a minimum and a caller-enforced process timeout.
+Fixed-work and sustained workloads are reported separately. The `qualification` feature adds
+actual publication-owner wait/hold histograms, process-wide Rust allocation
+requests and shared-runtime Cypher parse/preparation counters. The parser count
+includes admission and unprepared execution; the planner count includes cache
+lookup/binding and optimization on misses, including refused attempts. SQL and
+standalone parser users are outside that observation boundary. Instrumented
+timings are not ordinary release latency. See
+[`MEM_QUERY_CONCURRENCY.md`](MEM_QUERY_CONCURRENCY.md) for identical baseline
+porting, workload manifests, boundaries and missing acceptance evidence.
+
+The existing root general `api::publication::` family owns histogram boundary,
+completed-guard, failed-acquisition and unwind accounting tests. These are also
+compiled without qualification instrumentation in the minimal library build;
+only unit-test owners enable their counters automatically. No manual benchmark
+or additional fuzz job is added to CI.
+
+
+The native `process_memory_policy_contract` shared-reservation fixture refreshes
+its synthetic RSS sample after both persistent handles finish opening, before
+starting admission assertions. Slow Windows initialization must not accidentally
+turn the reservation-accounting test into sample-expiry coverage; the dedicated
+missing/unsupported/stale case retains its fail-closed assertions and zero-age
+sample. No production freshness limit changes.
+
+
+The root general `augmentation_jobs_lifecycle` and `augmentation_jobs_interrupt`
+modules now execute bounded parameterized Cypher directly. Status eligibility is
+in MATCH/WHERE, mutation is in SET or MERGE/ON CREATE, and multiple transitions
+share an ordinary explicit transaction. Caller-only input normalization retains
+duplicate input, empty-reason and finite-progress refusal coverage. Existing
+missing/status-mismatch, no-op epoch/WAL and one-batch durable-reopen assertions
+remain. The legacy CRUD adapters, storage scans and eight response/input DTOs
+are removed. These fixtures remain in their existing CI owner; local smoke does
+not replace those assertions.
+
+The same root general owner retains `graph_meta`, `schema_migrations`,
+`community_lifecycle`, `community_memberships` and `community_reads` through
+ordinary bounded queries. Coverage includes MERGE creation versus existing
+rows, sequential duplicate requests, read-your-own-writes, guarded updates,
+missing endpoints, stable projected ordering, separate count/page statements,
+plan-cache reuse, pinned reads, one-WAL-batch publication and exact reopen.
+An additional existing-only schema-migration case requires unchanged epoch and
+WAL bytes. Host-only ID/property/finite-value normalization retains refusal
+coverage. Twelve database mutation adapters, the Mem entity-delete forwarding
+method, two test read wrappers, their graph scans/response shaping and 48 DTOs
+disappear; request helpers only attach parameters
+and row/payload limits. The remaining business fixtures still need migration.
+
+
+`knowledge_entity_batch_deletes` and the root Source/Skill/Thread deletion cases
+use bounded parameterized IN predicates and DETACH DELETE directly. They retain
+scoped nonmatches, duplicate input, missing IDs, projected-idless protection,
+read-only refusal, incident-edge removal, unchanged unrelated nodes and one-batch
+recovery. They no longer use generic entity-delete response DTOs or business
+read helpers for their postconditions. Native CI retains the existing owners.
+
+### Property mutation query fixtures
+
+The property mutation cases in `src/api/tests.rs` and
+`src/api/tests/knowledge_property_batch_mutations.rs` now use ordinary bounded
+Cypher (five rows / 4 KiB per statement), fixed property names and explicit
+transactions for batch writes. Input normalization only checks that a requested
+assignment exists. Filtering and id matching stay in Cypher. Coverage preserves
+invalid syntax, missing/filtered targets, idless protection, no-op epochs,
+read-only refusal, exact changed/unchanged values and one-batch WAL/reopen.
+The existing `//:hawdb_unit_general_tests` partition in the root Prow lane
+owns execution; local lint compiles the cases but does not replace runtime
+results.
+
+Memory dedup-review fixtures use the same bounded request boundary, parameterized
+IN matching and one explicit transaction/WAL batch. The root API lane retains
+duplicate/missing/idless, empty-id and integer/string timestamp replay coverage.
+
+Memory metadata fixtures retain omitted-timestamp versus explicit-timestamp
+behavior, first-input duplicate precedence, missing/idless targets and durable
+one-batch replay through fixed bounded SET statements in the same root API lane.
+
+Memory content fixtures assert all 13 fields after a bounded parameterized SET,
+first-input duplicate precedence, missing/idless protection and one-batch reopen.
+Host input validation retains empty-id/unit/extraction and finite numeric checks.
+The general root partition owns these migrated cases.
+
+Memory access fixtures preserve repeated-touch increments, optional click/dwell
+fields, negative-dwell refusal and one-batch replay using arithmetic SET
+statements. Missing targets return no rows; host normalization does no graph
+aggregation. The general root partition owns these migrated cases.
+
+The memory decay refresh fixtures retain first-input deduplication, missing and
+idless target protection, optional-confidence preservation, finite-number input
+validation, exact values and one-batch reopen through bounded Cypher. Their
+execution remains in the existing root API partition.
+
+Lifecycle fixture corrections retain the original root cases: MERGE statements
+are followed by bounded identity/value reads inside the same explicit
+transaction; ordinary CREATE/DELETE statements use before/after state and
+committed delete counts rather than expecting immediate projected rows.
+Community summary presence and ordering use existing CASE predicates. The
+fixtures retain identity, idempotence, no-op epoch/WAL and reopen assertions.
+
+Normalized-space move fixtures use fixed Thread/Memory statements with
+CASE-normalized source predicates, target exclusions and identity-property
+matching. They preserve duplicate/missing/filtered targets, unchanged storage
+identities, optional timestamps, retry no-op epochs, invalid property syntax and
+one-batch WAL/reopen in the existing root API partition.
 ## License hook and subprocess lease handshake
 
 - `scripts/check-license-headers.test.py` is a local pinned-HawkEye fixture
@@ -445,6 +905,362 @@ Go test results; the Unix native binding jobs retain their existing profile.
 The native feature inventory audit also requires the independent telemetry
 Bazel spec and lock to match the workspace Cargo.lock package version, source
 and checksum. Update them together when upgrading the optional dependency.
+
+### Memory lifecycle and evolution queries
+
+`api::tests::memory_lifecycle` retains the ten lifecycle/latest/EVOLVES cases
+previously in the root API module, owned by the same root general Prow partition.
+Bounded parameterized SET/CREATE statements and explicit transactions preserve
+first-input duplicate handling, scoped nonmatches, missing/idless endpoints,
+exact property values, commit epochs and one-batch WAL/reopen. Input-only
+validation covers empty identifiers/state/relation and non-finite confidence
+before any database effect. The three database mutation adapters, twelve DTOs
+and final two Mem business forwarding methods are removed. Transaction and
+maintenance admission remain independent typed capabilities.
+
+### Skill lifecycle and source queries
+
+`api::tests::skill_lifecycle` retains eleven runtime cases from the root API
+module in the general Prow partition. Fixed bounded SET statements cover usage,
+optional success rate, metadata and lifecycle field groups. MATCH/MERGE/ON CREATE
+keeps source relationships idempotent, including stable identities/timestamps
+and unchanged WAL/epoch on retry or missing endpoints. Explicit transactions
+retain the single WAL batch and exact durable-reopen checks. Input normalization
+checks identifiers, lifecycle fields, nonnegative use count and finite bounded
+success rates. Four business adapters and fourteen DTOs are removed; their
+obsolete compile-only Skill DTO re-export identity assertion is removed too.
+
+### Thread lifecycle and cleanup queries
+
+`api::tests::thread_lifecycle` moves fifteen existing runtime cases from the root
+API module into the same general Prow owner. Fixed bounded queries preserve
+optional metadata timestamps, first-input duplicate handling, message counts
+with newer-timestamp protection, repeated CONTAINS edges versus distinct deleted
+messages, compaction endpoint/idless protection and exact/cascade identity
+selection. Predicates and graph traversal remain in Cypher. Explicit transactions
+and bounded reads verify affected counts, no-op epochs, unchanged survivors,
+single WAL batches and exact reopen. Five business methods, fifteen DTOs, their
+graph-inspection helpers and four old test read wrappers are removed.
+
+### Label lifecycle and transfer queries
+
+`api::tests::label_lifecycle` retains twelve root general cases through ordinary
+bounded parameterized requests. Fixed SET/DELETE statements cover omitted
+fields, duplicate input, missing/idless targets, exact/all label deletion and
+surviving endpoints. Transfer candidates are selected, filtered and deduplicated
+by Cypher; the host only binds each selected identity into an exact MERGE within
+the same explicit transaction. Coverage preserves duplicate source edges,
+space refusal, protected idless memories, existing relationship identity and
+properties, retry no-op epoch/WAL, single-batch recovery and exact reopen. Four
+business methods, twelve DTOs and their graph-scan helpers are removed. The
+entity-label read fixture migration is described below.
+
+### Entity label read queries
+
+`api::tests::entity_labels` retains four existing root general cases using one
+public read transaction and bounded parameterized requests. Separate entity
+lookup and label pages distinguish a missing entity from a found entity with
+no labels; Cypher owns ordering, projection and LIMIT. The same pinned reader
+preserves three cache hits on repeat, future-property projections and stable
+epochs. Malformed label/property syntax and empty normalized identities refuse
+without WAL changes. Two business read wrappers, their handwritten result
+shaping and eight DTOs are removed, completing removal of the test-only
+lifecycle DTO module. Runtime execution remains in the root general CI owner.
+
+### Source lifecycle and metadata queries
+
+`api::tests::source_lifecycle` retains six root general runtime cases through
+fixed bounded requests. Cypher predicates enforce current lifecycle state and
+external identity; optional chunk assignments use a separate statement. Host
+normalization validates identifiers, states and nonnegative chunk counts and
+retains first-input duplicates without graph inspection. Assertions preserve
+filtered/missing statement rows, empty commit output for SET RETURN, idless
+protection, omitted fields, timestamps, one WAL batch and exact durable reopen. Two business methods and eight mutation DTOs
+are removed. Source count, parsed/revision and label adapters remain separate
+migration work.
+
+### Source parsed metadata queries
+
+`api::tests::source_parsed_metadata` retains three root general cases with bounded
+parameterized SET statements. Base parsing fields and optional detail/path
+assignments remain separate statements in one explicit transaction. The cases
+preserve full versus omitted fields, empty file paths, missing/idless targets,
+first-input duplicates, exact timestamps/content, validation before WAL and
+one-batch durable reopen. One business adapter, four DTOs and the assignment
+factory disappear; no executor feature or runtime test ownership changes.
+Invalid-input coverage compares against the captured initial epoch, which may
+include persistent bootstrap work.
+
+### Source revision edge queries
+
+`api::tests::source_revisions` retains three root general cases using bounded
+parameterized endpoint reads and CREATE statements. Missing and idless source
+identities create no relationship; ordinary explicit-transaction CREATE returns
+no provisional rows, and commit/readback verifies the exact edge count and
+properties. Input rejection preserves WAL/epoch, while two valid creates retain
+one WAL batch and exact endpoints, timestamps and default properties on reopen.
+One business adapter, four DTOs and its relationship-request factory are removed.
+
+### Parsed Source creation queries
+
+`api::tests::source_parsed_create` retains three root general cases through fixed
+bounded MERGE/ON CREATE statements. Existing identities and repeated batch input
+preserve original nodes/properties; three source formats retain exact input and
+default fields. Pure input validation rejects missing fields, negative size and
+nonpositive version before WAL changes. Explicit transactions preserve one WAL
+batch, creation flags and complete durable-reopen contents. One business method,
+four DTOs and the typed entity-create factory are removed.
+
+### Source label relationship queries
+
+`api::tests::source_labels` retains six root general cases through bounded
+parameterized MERGE/ON CREATE and DELETE. Exact endpoint predicates protect
+missing/idless sources and labels; repeated/existing associations retain
+relationship identity and original properties. Staged pair reads, commit counts
+and exact readback cover selection and survivors. Invalid inputs leave WAL and
+epoch unchanged; both write families preserve one batch and durable reopen,
+including retained endpoint nodes. Two business methods and eight DTOs are
+removed with their typed relationship factories and validators.
+
+### Source memory-count queries
+
+`api::tests::source_memory_count` retains three root general cases with bounded
+point calculations followed by fixed SET in the same explicit transaction.
+Cypher computes increments and floor decrements; the host only binds computed
+values. Repeated inputs observe earlier staged counts, NULL starts at zero and
+missing identities produce no candidate. A nonnumeric stored count refuses its
+query while prior staged changes remain committable. Invalid input preserves
+WAL/epoch; two source updates retain one batch and exact reopen. One business
+method, four DTOs and the graph-side aggregation helpers are removed.
+Arithmetic stays in WITH/RETURN stages outside CASE branches, with a numeric
+operand check before clamping. Increment clamps the base to `i64::MAX - delta`
+before addition; decrement clamps the base to zero before adding its negative
+delta and floors the result, preserving MAX/MIN boundary coverage.
+
+### Source-reference cleanup queries
+
+`api::tests::source_reference` retains its five root general cases. The three
+mutation cases now use bounded parameterized CREATE/DELETE and candidate reads,
+removing the cleanup adapter, three DTOs and three generic create-fixture calls.
+Selection stays in Cypher; committed counts and exact survivor identities cover
+reference isolation and retained nodes. Empty/whitespace references refuse
+before WAL changes; setup-close/reopen-cleanup preserves one delete batch and
+exact durable recovery. Existing pinned read/cache and delete-guard cases stay
+in the same module and CI owner.
+
+### Crystal source association queries
+
+`api::tests::crystal_source` retains two root general cases through fixed bounded
+MERGE and same-transaction reads. The cases preserve numeric finite input checks,
+missing endpoints, exact relationship identity/properties, create versus retry
+outcomes, unchanged epoch/WAL on retry and one-batch durable reopen. Two DTOs
+and the business mutation adapter are removed without changing the CI owner.
+
+### Entity creation and update queries
+
+`api::tests::entity_writes` retains thirteen root general scenarios using bounded
+fixed MERGE, SET and exact projections. The tests distinguish ON CREATE from ON
+MATCH, preserve existing identity and properties, deduplicate batch inputs, reject
+invalid syntax/identity before WAL, refuse read-only mutations and retain one
+transaction batch with exact reopen values. The idless case exercises the
+external-id predicate on an update; internal projected identifiers cannot select
+that mutation. Four adapters, ten DTOs and dynamic statement factories disappear.
+The obsolete compile-only identity assertion for the removed entity-create DTO
+is removed separately from the thirteen runtime scenarios.
+
+### Relationship deletion queries
+
+`api::tests::{knowledge_relationship_deletes,knowledge_relationship_batch_deletes}`
+retain six autocommit and seven explicit-transaction scenarios through fixed
+bounded DELETE and projection queries. Endpoint/property/scope predicates stay
+in Cypher; missing endpoints, preserved nodes, partial scope matches, read-only
+refusal, invalid syntax before WAL and one-batch reopen remain covered. The
+idless fixture retains a real edge to prove an internal projected identifier
+cannot delete it. Four mutation adapters, seven DTOs and the dynamic deletion
+statement builder are removed. The obsolete compile-only identity assertion for
+the deleted DTO disappears separately; runtime root general ownership is unchanged.
+
+### Relationship property update queries
+
+`api::tests::knowledge_relationship_updates` retains nine root general scenarios
+through bounded SET and projection queries. Relationship properties and source
+scopes remain Cypher predicates; exact assignments, missing/idless endpoints,
+filtered no-ops, invalid/empty SET, read-only refusal and one-batch durable reopen
+remain covered. The idless case includes a real relationship whose weight must
+remain unchanged. Four adapters, seven DTOs and their dynamic SET builder are
+removed; non-returning SET results are verified through commit and readback.
+
+### Relationship creation and merge queries
+
+`api::tests::{knowledge_relationship_create_upserts,knowledge_relationship_batch_creates}`
+retain ten and six root general cases through bounded CREATE/MERGE and fixed
+readback. The cases preserve exact endpoint/property values, missing/idless
+protection, source/target scope predicates, repeated MERGE identity/properties,
+read-only refusal and one-batch durable reopen. Four fixture calls in two existing
+storage-recovery/statistics cases also use bounded CREATE; their out-of-core,
+checkpoint, cache/spill and exact-statistics assertions retain their CI owners.
+The last eight business mutation methods and fourteen DTOs are removed, along
+with the test-only analytics DTO module and handwritten mutation graph inspection.
+Read adapter migration and final runtime qualification remain separate work.
+
+### Entity and property query fixtures
+
+The four entity-read cases and six former root batch/property cases now share
+`src/api/tests/knowledge_entity_reads.rs`. Scope predicates and property
+projection execute in fixed parameterized statements. Separate candidate and
+visible phases share one snapshot and explicit cumulative output budgets;
+caller-slot shaping does not filter or traverse the graph. Cache cases inspect
+the snapshot cache (one template per statement), including separate exact and
+scoped templates. Missing identities, filtered identities, null properties,
+request order and exclusion of unselected payloads remain covered.
+
+The entity-detail case moves from the removed legacy lookup helper into that
+module, retaining exact distinct-neighbor and relationship counts. Its obsolete
+malformed legacy-DTO decoder unit is removed with the decoder. The navigation
+cases retain missing-identity and idless-node coverage through explicit external
+or internal identity queries; the implicit facade fallback is removed. Two
+existing out-of-core cases retain checkpointed entity/property reads and digest
+corruption refusal. These cases remain in the existing root general CI lane.
+Six read extension methods, eleven DTOs and the test-only mutation DTO module
+are removed; fourteen other read wrappers still require migration.
+
+### Crystal query fixtures
+
+Nine existing root cases move to `src/api/tests/crystal_reads.rs`. Fixed queries
+own key ranking, cursor predicates, limits, community grouping, distinct source
+counts, visibility ordering and default-value projections. Detail/page counts
+use separate statements on one snapshot with a cumulative row/payload budget.
+Invalid key/cursor combinations and empty/null community scopes remain caller
+validation. Cache assertions account for separate count/page templates and the
+snapshot cache. All field, path-multiplicity, pagination and read-only epoch
+checks remain in the root general CI lane. The three legacy wrappers, twelve
+DTOs and host-side graph-result sorting/truncation helpers are removed.
+
+### Community query fixtures
+
+The existing two visibility and four memory cases retain their files and root
+general CI owner. Visibility uses a bounded optional match and separate entity
+count, preserving entities without memories, label isolation, default latest
+flags, deterministic ordering and two-template cache reuse. Memory reads use
+fixed mentioned/ranked/direct statements with query-owned scope/unit/crystal
+predicates, distinct entity aggregation, ordered entity IDs and bounded output.
+The main three-phase case shares one snapshot and cumulative budget. Mixed
+sources remain separate named phases rather than a host-side graph merge.
+All existing field, missing/default, rank, invalid input and cache assertions
+remain query fixtures. Shared scope validation only normalizes caller input.
+Two read wrappers, ten DTOs and their handwritten join/filter/sort helpers are
+removed; navigation wrappers remain for the next migration.
+
+### Induced-edge query fixtures
+
+The two existing induced-edge cases move from `knowledge_navigation.rs` to
+`induced_edge_reads.rs` under the same root general CI owner. Parameterized
+identity, edge-count and ordered-page statements share an immutable snapshot
+and explicit cumulative row/payload budget. Queries own endpoint membership,
+strength/confidence/default selection, sorting and LIMIT. Caller missing-slot
+shaping only consumes selected identity rows. Exact endpoints/types/strengths,
+outside-node exclusion, total count independent of page size, repeat-cache hits
+and invalid empty input remain covered. One wrapper, three DTOs and the legacy
+host-side graph filtering/sorting helpers are removed.
+
+### Relationship read query fixtures
+
+Three existing navigation cases move to `relationship_reads.rs`. Separate seed,
+scope and bounded relationship-page queries retain caller order, missing and
+filtered seed distinctions, edge properties, unknown relationship-type empty
+results and snapshot cache reuse. The scoped phases share one snapshot and
+cumulative row/payload budget. The unknown-type fixture now asserts an existing
+seed plus an empty edge query rather than the deleted facade's synthetic zero
+seed counters. An existing out-of-core case additionally checks both exact edge
+types and targets before checkpoint. The same root general CI lane owns these
+cases. Two wrappers, four DTOs and legacy empty-group synthesis are removed;
+shared traversal internals remain until neighbor/path/subgraph migration.
+
+### Neighbor and dense navigation query fixtures
+
+Five existing navigation cases move to `neighbor_reads.rs`, retaining explicit
+internal identity for idless nodes, one/two-hop edge identities and properties,
+incoming/outgoing matching, unknown types, normalized scope, missing seeds,
+LIMIT 0 and deterministic limited pages with cache reuse. Fixed hop statements
+replace the old host traversal; the main traversal phases share a cumulative
+snapshot budget. An empty unknown-type result remains valid after the delivered
+row quota is consumed. Fixture creation now uses ordinary queries.
+
+The dense fixture still creates exactly the dense-adjacency threshold and
+checks the physical group's layout, node, degree and untyped group enumeration.
+Typed/untyped ordinary profiled reads return every exact relationship and target
+under explicit output limits; distinct-neighbor count plus the seed retain the
+subgraph cardinality check. The deleted facade's reason DTO/string fields are
+not claimed as ordinary query-report fields. Existing out-of-core checkpoint
+and reopen neighbor reads now use fixed statements, including exact target and
+weight checks. These cases remain in the root general CI lane. Two wrappers,
+three DTOs, their traversal helpers and one obsolete compile-only DTO re-export
+identity assertion are removed; path/subgraph fixtures remain to migrate.
+
+### Crystal key-ranking parser regression
+
+`crystal_key_ranking_preserves_exact_prefix_and_contains_order` exercises both
+Crystal projections with a Unicode key and conflicting importance/lexical
+orders. It keeps exact matches before prefixes before contains matches, excludes
+non-Crystals, and checks the cumulative six-row snapshot budget. Prefix ranking
+uses `left(id, $key_chars) = $key` because `STARTS WITH` is a WHERE predicate,
+not a supported CASE condition. The existing two failing Crystal CI fixtures
+retain their result and cache assertions. The root general CI lane owns these
+ordinary-query runtime checks.
+
+### Final path and subgraph query fixtures
+
+All six path/subgraph runtime cases in `knowledge_navigation.rs` now execute
+fixed parameterized statements. Endpoint identity, one/two-hop paths, both
+edge types, wrong direction, unknown types, source/target scopes, LIMIT 0,
+zero allowed hops, missing endpoints and snapshot cache reuse remain covered.
+Node pages use bounded zero-to-two-hop expansion; edge pages restrict both
+endpoints to the query-selected node IDs. Host code only passes those selected
+IDs to the next statement. The main path/subgraph phases share cumulative
+snapshot budgets and assert exact identities, relationship types/properties
+and commit epochs. All fixture creation uses ordinary queries.
+
+These are bounded query fixtures, not a replacement generic BFS adapter.
+Retired facade diagnostics and synthetic unknown-type node counts are removed;
+an explicit seed lookup still distinguishes an existing seed from an empty
+relationship result. Four wrappers, their request/output/diagnostic models,
+legacy traversal/decoding/filter helpers, the test-support trait and both
+re-export modules are removed. The obsolete contracts and facade fallback-enum encoding
+units are removed with their enum; all six graph runtime cases remain in the root
+general CI lane. Production retrieval retains its outgoing/incoming dense
+adjacency reports using the existing storage directions directly.
+
+The final navigation fixtures use scalar CASE comparisons for parameterized hop
+bounds. Bare WHERE parameter predicates support equality/null checks, not ordered
+comparisons. Bidirectional one/two-hop checks use fixed one-hop edges per pattern;
+the frontend intentionally rejects non-outgoing variable-length patterns even
+for missing endpoints or unknown relationship types. These syntax repairs retain
+all exact-result, missing-endpoint, zero-hop and exhausted-budget assertions.
+
+### Query-first concurrency review regressions
+
+PR #1194 review repairs extend the existing root, search and Tokio test owners;
+no execution lane, profile, timeout or discovery filter changes. Root autocommit
+coverage pins a data writer before execution, publishes a new graph label, then
+checks catalog/data preservation through checkpoint and reopen; UUID predicate
+locks use the storage column type, and constraint/configuration changes reject
+stale preparation. Embedded and Tokio cases cover execution that fits capacity
+only after retained preparation is released. Search cases cover admitted lazy
+resident RaBitQ reuse and refusal before allocation. Mem incremental maintenance
+retains its reader/configuration after a descriptor refusal and retries on the
+same handle. Query profiles count delivered SKIP/LIMIT rows once. Migrated route
+fixtures execute repeated MERGE and missing/NULL assignments; parameter-only
+normalization tests are named explicitly and are not database coverage.
+
+These regressions run in the existing required Cargo/Bazel root/crate CI suites.
+Local-only verification remains the Shiro regression/smoke targets and the short
+MVCC campaign documented above.
+
+The query-first review regressions also cover Mem report/stream admission when
+execution fits but retained preparation does not, and route qualification
+statements that exceed explicit row or payload ceilings. These live in
+`src/nowledge_mem/read_execution.rs` and `src/graph_route_evidence_tests.rs` under
+the existing root library test targets.
 
 ### Pinned full-scan input cost
 

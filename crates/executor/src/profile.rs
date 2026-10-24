@@ -91,6 +91,7 @@ impl QueryStoredValues {
 }
 
 mod owned_result;
+pub(crate) use owned_result::cloned_row_memory_bytes;
 
 /// One owned handle into a query's immutable row storage.
 #[derive(Clone)]
@@ -851,6 +852,8 @@ fn row_equals_map(row: QueryRowRef<'_>, other: &Row) -> bool {
 pub enum RowRef<'a> {
     Map(&'a Row),
     Columnar(ColumnarRowRef<'a>),
+    Compact(QueryRowRef<'a>),
+    Projected(ProjectedRowRef<'a>),
 }
 
 impl<'a> RowRef<'a> {
@@ -858,6 +861,8 @@ impl<'a> RowRef<'a> {
         match self {
             Self::Map(row) => row.len(),
             Self::Columnar(_) => self.iter().count(),
+            Self::Compact(row) => row.len(),
+            Self::Projected(row) => row.columns.len(),
         }
     }
 
@@ -869,6 +874,8 @@ impl<'a> RowRef<'a> {
         match self {
             Self::Map(row) => row.get(name).map(Value::as_ref),
             Self::Columnar(row) => row.get(name),
+            Self::Compact(row) => row.get(name).map(Value::as_ref),
+            Self::Projected(row) => row.get(name),
         }
     }
 
@@ -879,6 +886,11 @@ impl<'a> RowRef<'a> {
                 .nth(index)
                 .map(|(name, value)| (name.as_str(), value.as_ref())),
             Self::Columnar(row) => row.column(index),
+            Self::Compact(row) => Some((
+                row.schema().columns().get(index)?.as_str(),
+                row.value(index)?.as_ref(),
+            )),
+            Self::Projected(row) => row.column(index),
         }
     }
 
@@ -886,6 +898,8 @@ impl<'a> RowRef<'a> {
         match self {
             Self::Map(row) => RowRefIter::Map(row.iter()),
             Self::Columnar(row) => RowRefIter::Columnar { row, index: 0 },
+            Self::Compact(row) => RowRefIter::Compact { row, index: 0 },
+            Self::Projected(row) => RowRefIter::Projected { row, index: 0 },
         }
     }
 
@@ -893,6 +907,38 @@ impl<'a> RowRef<'a> {
         self.iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned_value()))
             .collect()
+    }
+}
+
+/// A schema-bound view of native projection values. Payloads belong to the
+/// source batch or plan and are valid only during the consumer invocation.
+#[derive(Clone, Copy)]
+pub struct ProjectedRowRef<'a> {
+    pub(crate) columns: &'a [(String, usize)],
+    pub(crate) value: &'a (dyn Fn(usize) -> ValueRef<'a> + Sync),
+}
+
+impl std::fmt::Debug for ProjectedRowRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_map()
+            .entries(RowRef::Projected(*self).iter())
+            .finish()
+    }
+}
+
+impl<'a> ProjectedRowRef<'a> {
+    pub fn column(self, index: usize) -> Option<(&'a str, ValueRef<'a>)> {
+        let (name, projection) = self.columns.get(index)?;
+        Some((name.as_str(), (self.value)(*projection)))
+    }
+
+    pub fn get(self, name: &str) -> Option<ValueRef<'a>> {
+        let index = self
+            .columns
+            .binary_search_by(|(column, _)| column.as_str().cmp(name))
+            .ok()?;
+        self.column(index).map(|(_, value)| value)
     }
 }
 
@@ -908,10 +954,25 @@ impl<'a> From<ColumnarRowRef<'a>> for RowRef<'a> {
     }
 }
 
+impl<'a> From<QueryRowRef<'a>> for RowRef<'a> {
+    fn from(row: QueryRowRef<'a>) -> Self {
+        Self::Compact(row)
+    }
+}
+
+#[derive(Clone)]
 pub enum RowRefIter<'a> {
     Map(std::collections::btree_map::Iter<'a, String, Value>),
     Columnar {
         row: ColumnarRowRef<'a>,
+        index: usize,
+    },
+    Compact {
+        row: QueryRowRef<'a>,
+        index: usize,
+    },
+    Projected {
+        row: ProjectedRowRef<'a>,
         index: usize,
     },
 }
@@ -934,6 +995,16 @@ impl<'a> Iterator for RowRefIter<'a> {
                     return Some(column);
                 }
             },
+            Self::Compact { row, index } => {
+                let column = RowRef::Compact(*row).column(*index)?;
+                *index += 1;
+                Some(column)
+            }
+            Self::Projected { row, index } => {
+                let column = row.column(*index)?;
+                *index += 1;
+                Some(column)
+            }
         }
     }
 }
@@ -976,6 +1047,9 @@ pub struct PipelineMemoryReport {
     /// Rows projected from source property references before owned output admission.
     /// This counter does not claim source-to-host zero-copy delivery.
     pub borrowed_node_projection_rows: usize,
+    /// Native projected row views delivered without constructing a row map.
+    /// Owned/validated consumers may still copy admitted values for retention.
+    pub native_projection_rows: usize,
     /// Number of typed columnar batches evaluated by eligible pipeline fragments.
     pub columnar_batches: usize,
     /// Rows loaded into typed columns before selection.

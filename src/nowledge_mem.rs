@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
-use crate::api::{
-    KnowledgeEntityDeleteBatchOutput, KnowledgeEntityDeleteBatchRequest,
-    KnowledgeMemoryEvolvesCreateBatchOutput, KnowledgeMemoryEvolvesCreateBatchRequest,
-    KnowledgeMemoryLifecycleBatchOutput, KnowledgeMemoryLifecycleBatchRequest,
-};
 use crate::search::{
     AdaptiveVectorSearchOptions, CompressedVectorSearchMode, SearchFallbackReasonCode,
     SearchLexicalProductionQualificationReport, SearchOutOfCoreConfig,
@@ -67,7 +61,12 @@ use crate::{
     },
 };
 use hawdb_core::RuntimeTaskContext;
+mod concurrent_owner;
 mod incremental_search;
+mod read_execution;
+mod resident_read;
+mod search_read;
+use resident_read::ResidentProjectionRef;
 mod registered_search;
 use hawdb_optimizer::AdaptiveVectorBackendPolicy;
 use hawdb_qos::{
@@ -152,7 +151,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 #[cfg(test)]
@@ -1427,17 +1426,48 @@ impl NowledgeMemGraph {
         external: &mut dyn crate::executor::ExternalReadOperator,
         task_context: &RuntimeTaskContext,
     ) -> Result<NowledgeMemQueryOutput> {
+        self.query_request_with_report_and_external(
+            crate::QueryRequest::new(cypher)
+                .with_params(parameters)
+                .with_task_context(task_context),
+            options,
+            external,
+        )
+    }
+
+    pub(crate) fn query_request_with_report(
+        &mut self,
+        request: crate::QueryRequest<'_>,
+        options: NowledgeMemQueryReportOptions,
+    ) -> Result<NowledgeMemQueryOutput> {
+        self.query_request_with_report_and_external(
+            request,
+            options,
+            &mut crate::executor::NoExternalReadOperator,
+        )
+    }
+
+    fn query_request_with_report_and_external(
+        &mut self,
+        request: crate::QueryRequest<'_>,
+        options: NowledgeMemQueryReportOptions,
+        external: &mut dyn crate::executor::ExternalReadOperator,
+    ) -> Result<NowledgeMemQueryOutput> {
+        let default_context = RuntimeTaskContext::default();
+        let task_context = request.task_context.unwrap_or(&default_context);
+        let empty = BTreeMap::new();
+        let parameters = request.parameters.unwrap_or(&empty);
+        let cypher = request.cypher;
         self.check_runtime_context(task_context)?;
-        let (permit, is_mutation) = self.admit_materialized_query(cypher, parameters)?;
+        let (permit, prepared) = self.admit_materialized_query(cypher, parameters)?;
+        let is_mutation = prepared.admission().is_mutation;
         let execution_task_context = permit.bind_task_context(task_context.clone());
         let started = Instant::now();
-        let result = self.db.query_with_params_trace_and_external_with_context(
-            cypher,
-            parameters,
+        let result = self.db.query_prepared_request_with_trace_and_external(
+            prepared,
+            request.with_task_context(&execution_task_context),
             options.capture_physical_plan,
             external,
-            None,
-            Some(&execution_task_context),
         );
         self.record_runtime_cancellation(result.as_ref().err(), task_context);
         let (output, execution_trace) = result?;
@@ -1462,85 +1492,74 @@ impl NowledgeMemGraph {
         &self,
         cypher: &str,
         parameters: &BTreeMap<String, Value>,
-    ) -> Result<(RuntimePermit, bool)> {
-        let admission = self.db.runtime_admission_plan(cypher, parameters)?;
-        let is_mutation = admission.is_mutation;
-        let governor_budget = self.runtime_governor.snapshot().limits.result_budget_bytes;
-        let result_budget = if admission.is_mutation {
-            governor_budget
-        } else {
-            let configured = self
-                .db
-                .config()
-                .max_read_result_payload_bytes
-                .ok_or_else(|| {
-                    HawDBError::Execution(
-                        "admitted materialized query requires max_read_result_payload_bytes"
-                            .to_string(),
-                    )
-                })?;
-            let configured = u64::try_from(configured).unwrap_or(u64::MAX);
-            if configured > governor_budget {
-                return Err(HawDBError::Execution(format!(
-                    "admitted materialized query payload budget {configured} exceeds runtime result budget {governor_budget}"
-                )));
-            }
-            configured
-        };
-        self.try_admit_runtime(
-            admission
-                .runtime_work_request_for_snapshot(result_budget, self.runtime_governor.snapshot()),
-        )
-        .map(|permit| (permit, is_mutation))
+    ) -> Result<(RuntimePermit, crate::api::PreparedRuntimeQuery)> {
+        let prepared = self.prepare_admitted_query(cypher, parameters)?;
+        let admission = prepared.admission();
+        let result_budget = read_execution::materialized_result_budget(
+            self.db.config(),
+            &self.runtime_governor,
+            admission.is_mutation,
+        )?;
+        let request = admission
+            .runtime_work_request_for_snapshot(result_budget, self.runtime_governor.snapshot())
+            .with_retained_memory_bytes(prepared.planning_memory_bytes());
+        read_execution::admit_reusable_prepared(prepared, &self.runtime_governor, request, || {
+            self.db
+                .prepare_runtime_query(cypher.to_string(), parameters)
+        })
+    }
+
+    fn prepare_admitted_query(
+        &self,
+        cypher: &str,
+        parameters: &BTreeMap<String, Value>,
+    ) -> Result<crate::api::PreparedRuntimeQuery> {
+        let request = crate::api::runtime_planning_request(
+            cypher.len(),
+            hawdb_qos::RuntimeWorkPriority::Foreground,
+        );
+        let permit = self.try_admit_runtime(request)?;
+        let prepared = self
+            .db
+            .prepare_runtime_query(cypher.to_string(), parameters)?;
+        Ok(prepared.with_planning_memory(
+            permit
+                .into_retained_memory()
+                .expect("control work owns a fixed memory reservation"),
+        ))
     }
 
     fn admit_streaming_query(
         &self,
         cypher: &str,
         parameters: &BTreeMap<String, Value>,
-        result_budget_bytes: usize,
-    ) -> Result<RuntimePermit> {
-        let admission = self.db.runtime_admission_plan(cypher, parameters)?;
+        result_memory_bytes: u64,
+    ) -> Result<(RuntimePermit, crate::api::PreparedRuntimeQuery)> {
+        let prepared = self.prepare_admitted_query(cypher, parameters)?;
+        let admission = prepared.admission();
         if admission.is_mutation {
             return Err(HawDBError::Execution(
                 "admitted streaming query must be read-only".to_string(),
             ));
         }
-        self.try_admit_runtime(admission.runtime_work_request_for_snapshot(
-            u64::try_from(result_budget_bytes).unwrap_or(u64::MAX),
-            self.runtime_governor.snapshot(),
-        ))
-    }
-
-    fn try_admit_runtime(&self, request: hawdb_qos::RuntimeWorkRequest) -> Result<RuntimePermit> {
-        self.runtime_governor.try_admit(request).map_err(|error| {
-            if error.is_retryable() {
-                self.runtime_governor
-                    .record_admission_wait(request, error.code, 0);
-            }
-            HawDBError::Execution(error.to_string())
+        let request = admission
+            .runtime_work_request_for_snapshot(
+                result_memory_bytes,
+                self.runtime_governor.snapshot(),
+            )
+            .with_retained_memory_bytes(prepared.planning_memory_bytes());
+        read_execution::admit_reusable_prepared(prepared, &self.runtime_governor, request, || {
+            self.db
+                .prepare_runtime_query(cypher.to_string(), parameters)
         })
     }
 
+    fn try_admit_runtime(&self, request: hawdb_qos::RuntimeWorkRequest) -> Result<RuntimePermit> {
+        try_admit_runtime(&self.runtime_governor, request)
+    }
+
     fn admitted_streaming_result_bytes(&self, options: &NowledgeMemReadOptions) -> Result<usize> {
-        let governor_budget =
-            usize::try_from(self.runtime_governor.snapshot().limits.result_budget_bytes)
-                .unwrap_or(usize::MAX);
-        let configured = self
-            .db
-            .config()
-            .max_read_result_payload_bytes
-            .unwrap_or(governor_budget);
-        let requested = options
-            .max_estimated_payload_bytes
-            .unwrap_or(governor_budget);
-        let admitted = governor_budget.min(configured).min(requested);
-        if admitted == 0 {
-            return Err(HawDBError::Execution(
-                "admitted streaming query requires a non-zero result byte budget".to_string(),
-            ));
-        }
-        Ok(admitted)
+        read_execution::admitted_result_bytes(self.db.config(), &self.runtime_governor, options)
     }
 
     fn check_runtime_context(&self, task_context: &RuntimeTaskContext) -> Result<()> {
@@ -1627,18 +1646,23 @@ impl NowledgeMemGraph {
     ) -> Result<QueryStreamReport> {
         self.check_runtime_context(task_context)?;
         let max_payload_bytes = self.admitted_streaming_result_bytes(options)?;
-        let permit = self.admit_streaming_query(cypher, parameters, max_payload_bytes)?;
+        let (permit, prepared) = self.admit_streaming_query(
+            cypher,
+            parameters,
+            read_execution::result_memory_budget(self.db.config(), &self.runtime_governor),
+        )?;
         let execution_task_context = permit.bind_task_context(task_context.clone());
         let result = self
             .db
             .begin_read_transaction()?
-            .query_with_params_streaming_context(
-                cypher,
+            .query_prepared_with_params_streaming_context(
+                prepared,
                 parameters,
                 QueryStreamOptions {
                     max_rows: options.max_rows,
                     max_payload_bytes: Some(max_payload_bytes),
                 },
+                crate::executor::StreamDelivery::Validated,
                 &execution_task_context,
                 consumer,
             );
@@ -1646,22 +1670,36 @@ impl NowledgeMemGraph {
         result
     }
 
-    /// Collects host-owned rows through the streaming consumer boundary.
-    /// This retains the legacy `NowledgeMemReadOutput` shape while ensuring
-    /// bounded results are validated before any row crosses into the host.
+    /// Collects compact owned rows with the same limits as streaming reads.
+    /// No result becomes observable before complete execution and validation.
     pub fn read_query_with_params_streaming_collect(
         &self,
         cypher: &str,
         parameters: &BTreeMap<String, Value>,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        let mut rows = Vec::new();
-        let streamed =
-            self.read_query_with_params_streaming(cypher, parameters, options, |row| {
-                rows.push(row);
-                Ok(())
-            })?;
-        streamed_nowledge_mem_read_output(self.mode, rows, streamed, options)
+        let max_payload_bytes = self.admitted_streaming_result_bytes(options)?;
+        let (permit, prepared) = self.admit_streaming_query(
+            cypher,
+            parameters,
+            read_execution::result_memory_budget(self.db.config(), &self.runtime_governor),
+        )?;
+        let task_context = permit.bind_task_context(RuntimeTaskContext::default());
+        let bounded = self
+            .db
+            .begin_read_transaction()?
+            .query_prepared_with_params_profiled_context(
+                prepared,
+                parameters,
+                QueryStreamOptions {
+                    max_rows: options.max_rows,
+                    max_payload_bytes: Some(max_payload_bytes),
+                },
+                &task_context,
+            )?;
+        let mut output = bounded_nowledge_mem_read_output(self.mode, bounded, options)?;
+        output.report.streaming = true;
+        Ok(output)
     }
 
     pub fn graph_rag_schema_context(
@@ -1677,10 +1715,27 @@ impl NowledgeMemGraph {
         parameters: &BTreeMap<String, Value>,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        let bounded = self
-            .db
-            .begin_read_transaction()?
-            .query_generated_graph_rag_bounded_profile(query, parameters, options.max_rows)?;
+        query
+            .validate_parameters(parameters)
+            .map_err(|error| HawDBError::Semantic(error.to_string()))?;
+        let max_payload_bytes = self.admitted_streaming_result_bytes(options)?;
+        let (permit, prepared) = self.admit_streaming_query(
+            query.cypher(),
+            parameters,
+            read_execution::result_memory_budget(self.db.config(), &self.runtime_governor),
+        )?;
+        let context = permit.bind_task_context(RuntimeTaskContext::default());
+        let mut read = self.db.begin_read_transaction_with_context(&context)?;
+        read.validate_generated_graph_rag(query, parameters)?;
+        let bounded = read.query_prepared_with_params_profiled_context(
+            prepared,
+            parameters,
+            QueryStreamOptions {
+                max_rows: options.max_rows,
+                max_payload_bytes: Some(max_payload_bytes),
+            },
+            &context,
+        )?;
         bounded_nowledge_mem_read_output(self.mode, bounded, options)
     }
 }
@@ -1692,7 +1747,7 @@ pub struct NowledgeMemSearchProjection {
 
 #[derive(Debug)]
 pub struct NowledgeMemOutOfCoreSearchProjection {
-    reader: SearchOutOfCoreReader,
+    reader: Arc<SearchOutOfCoreReader>,
     maintenance: Option<(PathBuf, NowledgeMemIncrementalSearchMaintenanceOptions)>,
 }
 
@@ -1722,14 +1777,14 @@ impl From<NowledgeMemOutOfCoreSearchCandidateOutput> for NowledgeMemSearchCandid
 impl NowledgeMemOutOfCoreSearchProjection {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            reader: SearchOutOfCoreReader::open(path)?,
+            reader: Arc::new(SearchOutOfCoreReader::open(path)?),
             maintenance: None,
         })
     }
 
     pub fn open_with_config(path: impl AsRef<Path>, config: SearchOutOfCoreConfig) -> Result<Self> {
         Ok(Self {
-            reader: SearchOutOfCoreReader::open_with_config(path, config)?,
+            reader: Arc::new(SearchOutOfCoreReader::open_with_config(path, config)?),
             maintenance: None,
         })
     }
@@ -1768,6 +1823,13 @@ impl NowledgeMemOutOfCoreSearchProjection {
 
     pub fn reader(&self) -> &SearchOutOfCoreReader {
         &self.reader
+    }
+
+    fn read_snapshot(&self) -> Self {
+        Self {
+            reader: Arc::clone(&self.reader),
+            maintenance: None,
+        }
     }
 
     pub fn freshness(&self) -> SearchProjectionFreshness {
@@ -2054,7 +2116,7 @@ impl NowledgeMemSearchProjection {
 }
 
 struct SearchProjectionExternalReadOperator<'a> {
-    projection: Option<&'a NowledgeMemSearchProjection>,
+    projection: Option<ResidentProjectionRef<'a>>,
     out_of_core_projection: Option<&'a NowledgeMemOutOfCoreSearchProjection>,
     vector_seed_execution_count: usize,
 }
@@ -2081,7 +2143,7 @@ impl SearchProjectionExternalReadOperator<'_> {
             let default_task = RuntimeTaskContext::default();
             let task = request.resources.task_context.unwrap_or(&default_task);
             let scored = if complete {
-                projection.index().complete_text_seed_scores_with_context(
+                projection.complete_text_seed_scores_with_context(
                     request.query_text,
                     request.metadata_filters,
                     request.resources.result.max_rows,
@@ -2089,7 +2151,7 @@ impl SearchProjectionExternalReadOperator<'_> {
                     task,
                 )
             } else {
-                projection.index().text_seed_scores_with_context(
+                projection.text_seed_scores_with_context(
                     request.query_text,
                     request.metadata_filters,
                     request.resources.result.max_rows,
@@ -2105,7 +2167,7 @@ impl SearchProjectionExternalReadOperator<'_> {
             if complete {
                 for (id, score) in scored.scores() {
                     request.resources.checkpoint()?;
-                    let document = projection.index().document(id).ok_or_else(|| {
+                    let document = projection.document(id).ok_or_else(|| {
                         HawDBError::Storage(format!("text seed document {id} is missing"))
                     })?;
                     output.push(
@@ -2131,7 +2193,7 @@ impl SearchProjectionExternalReadOperator<'_> {
             });
             for (id, score) in ranked {
                 request.resources.checkpoint()?;
-                let document = projection.index().document(id).ok_or_else(|| {
+                let document = projection.document(id).ok_or_else(|| {
                     HawDBError::Storage(format!("text seed document {id} is missing"))
                 })?;
                 output.push(
@@ -2437,6 +2499,7 @@ impl crate::DatabasePublicationState for NowledgeMemEmbeddedStore {
 #[derive(Debug, Clone)]
 pub struct NowledgeMemEmbeddedStoreHandle {
     inner: Arc<crate::DatabasePublicationOwner<NowledgeMemEmbeddedStore>>,
+    concurrent: crate::ConcurrentDatabase,
     published_read: Arc<Mutex<Option<PublishedCanonicalRead>>>,
     // One-way: a failed or panicking write guard sets this and leaves the
     // last-good publication untouched, so readers fail closed instead of
@@ -2447,22 +2510,42 @@ pub struct NowledgeMemEmbeddedStoreHandle {
 #[derive(Debug)]
 struct PublishedCanonicalRead {
     instance_identity: crate::DatabaseInstanceIdentity,
-    snapshot: crate::api::DatabaseReadSnapshot,
+    view: Arc<crate::api::PublishedConcurrentRead>,
     governor: RuntimeGovernor,
+    mode: NowledgeMemGraphMode,
+    resident_projection: Option<crate::search::SearchIndexReadSnapshot>,
+    external_seed_io_slots: usize,
+    retrieval_projection_advisor: NowledgeMemRetrievalProjectionAdvisor,
+    out_of_core_projection: Option<NowledgeMemOutOfCoreSearchProjection>,
 }
 
 impl PublishedCanonicalRead {
     fn capture(store: &NowledgeMemEmbeddedStore) -> Result<Self> {
         Ok(Self {
             instance_identity: store.graph.database().instance_identity()?,
-            snapshot: store.graph.database().read_snapshot()?,
+            view: Arc::new(crate::api::PublishedConcurrentRead::capture(
+                store.graph.database(),
+            )?),
             governor: store.graph.runtime_governor().clone(),
+            mode: store.graph.mode,
+            resident_projection: store
+                .search_projection
+                .as_ref()
+                .map(|projection| projection.index().read_snapshot()),
+            external_seed_io_slots: store.external_seed_io_slots(),
+            retrieval_projection_advisor: store.retrieval_projection_advisor.clone(),
+            out_of_core_projection: store
+                .out_of_core_search_projection
+                .as_ref()
+                .map(NowledgeMemOutOfCoreSearchProjection::read_snapshot),
         })
     }
 }
 
 struct EmbeddedStoreWriteGuard<'a> {
     store: crate::api::publication::DatabasePublicationWriteGuard<'a, NowledgeMemEmbeddedStore>,
+    _exclusive: Option<crate::api::ExclusiveDatabaseLease>,
+    retired: Option<PublishedCanonicalRead>,
     published: &'a Mutex<Option<PublishedCanonicalRead>>,
     read_publication_failed: &'a AtomicBool,
 }
@@ -2503,28 +2586,23 @@ impl Drop for EmbeddedStoreWriteGuard<'_> {
                 return;
             }
         };
-        let previous = self
+        self.retired = self
             .published
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .replace(next);
         // Releasing the last generation pin can acquire the pin registry lock.
         // Keep that destructor outside the publication critical section.
-        drop(previous);
     }
 }
 
 pub struct NowledgeMemReadSnapshot<'a> {
     instance_identity: crate::DatabaseInstanceIdentity,
-    transaction: crate::DatabaseReadTransaction,
+    transaction: crate::BudgetedReadSnapshot,
     external: SearchProjectionExternalReadOperator<'a>,
     search_projection_source_graph_commit_epoch: Option<u64>,
     search_projection_durable_source_graph_commit_epoch: Option<u64>,
     budget: NowledgeMemReadSnapshotBudget,
-    cypher_statement_count: usize,
-    sql_statement_count: usize,
-    output_rows: usize,
-    output_payload_bytes: usize,
     task_context: RuntimeTaskContext,
 }
 
@@ -2533,7 +2611,7 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
         transaction: crate::DatabaseReadTransaction,
         instance_identity: crate::DatabaseInstanceIdentity,
         budget: NowledgeMemReadSnapshotBudget,
-        projection: Option<&'a NowledgeMemSearchProjection>,
+        projection: Option<ResidentProjectionRef<'a>>,
         out_of_core_projection: Option<&'a NowledgeMemOutOfCoreSearchProjection>,
         task_context: RuntimeTaskContext,
     ) -> Self {
@@ -2543,7 +2621,10 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
             (None, None) | (Some(_), Some(_)) => None,
         };
         Self {
-            transaction,
+            transaction: transaction.into_bounded(crate::ReadSnapshotBudget {
+                max_rows: budget.max_rows,
+                max_payload_bytes: budget.max_payload_bytes,
+            }),
             instance_identity,
             external: SearchProjectionExternalReadOperator {
                 projection,
@@ -2557,10 +2638,6 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
                 .as_ref()
                 .and_then(|value| value.durable_source_graph_commit_epoch),
             budget,
-            cypher_statement_count: 0,
-            sql_statement_count: 0,
-            output_rows: 0,
-            output_payload_bytes: 0,
             task_context,
         }
     }
@@ -2612,32 +2689,16 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
         request: crate::QueryRequest<'_>,
         max_rows: usize,
     ) -> Result<BoundedReadQueryOutput> {
-        let completed_statement_count =
-            self.cypher_statement_count.checked_add(1).ok_or_else(|| {
-                HawDBError::Execution(
-                    "bounded read snapshot Cypher statement count overflowed".to_string(),
-                )
-            })?;
         let max_rows = self.statement_row_budget(max_rows)?;
         let max_payload_bytes = self.remaining_payload_bytes()?;
-        let mut rows = Vec::new();
-        let report = self.transaction.query_request_streaming_with_external(
+        let result = self.transaction.query_request_profiled_with_external(
             request.with_restrictive_output_limits(QueryStreamOptions {
                 max_rows: Some(max_rows),
                 max_payload_bytes: Some(max_payload_bytes),
             }),
             &mut self.external,
-            |row| {
-                rows.push(row);
-                Ok(())
-            },
         )?;
-        self.consume(report.output_rows, report.output_payload_bytes)?;
-        self.cypher_statement_count = completed_statement_count;
-        Ok(BoundedReadQueryOutput {
-            output: QueryOutput { rows: rows.into() },
-            execution_profile: report.execution_profile,
-        })
+        Ok(result)
     }
 
     pub fn query_sql(
@@ -2646,32 +2707,21 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
         parameters: &[Value],
         max_rows: usize,
     ) -> Result<QueryOutput> {
-        let completed_statement_count =
-            self.sql_statement_count.checked_add(1).ok_or_else(|| {
-                HawDBError::Execution(
-                    "bounded read snapshot SQL statement count overflowed".to_string(),
-                )
-            })?;
         let max_rows = self.statement_row_budget(max_rows)?;
         let max_payload_bytes = self.remaining_payload_bytes()?;
-        let output = self.transaction.query_sql_with_params_options(
-            sql,
-            parameters,
-            QueryStreamOptions {
-                max_rows: Some(max_rows),
-                max_payload_bytes: Some(max_payload_bytes),
-            },
-        )?;
-        let output_rows = output.rows.len();
-        let output_payload_bytes = estimate_query_output_payload_bytes(&output);
-        self.consume(output_rows, output_payload_bytes)?;
-        self.sql_statement_count = completed_statement_count;
-        Ok(output)
+        self.transaction.query_sql_request(
+            crate::SqlQueryRequest::new(sql)
+                .with_params(parameters)
+                .with_output_limits(QueryStreamOptions {
+                    max_rows: Some(max_rows),
+                    max_payload_bytes: Some(max_payload_bytes),
+                }),
+        )
     }
 
     /// Visits the complete current projection under this snapshot's retained pin.
-    /// The visitor runs synchronously under the store read guard. It must not
-    /// reenter the store or wait for an async source while retaining this guard.
+    /// Both resident and out-of-core visitors own an immutable generation and
+    /// may overlap writers without retaining the store read guard.
     ///
     /// Order is unspecified. A visitor prefix is not exhaustion evidence: only
     /// the successful returned report certifies completion. Retained copies are
@@ -2681,8 +2731,7 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
     /// Cypher/SQL reads charge `Value` payload estimates, including value overhead.
     /// These charges share the cumulative cap but differ by output representation.
     /// Out-of-core scans read all physical payloads twice and probe visible ID
-    /// routes during preflight. The read guard blocks writers throughout; lock
-    /// duration depends on physical bytes, inventory and storage throughput.
+    /// routes during preflight, without retaining the publication lock.
     /// Emit callbacks may precede final checksum validation, so a later error
     /// invalidates completion even after callbacks have run.
     pub fn visit_search_projection(
@@ -2699,11 +2748,9 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
             self.external.projection,
             self.external.out_of_core_projection,
         ) {
-            (Some(projection), None) => projection.index().visit_projection_documents(
-                budget,
-                &self.task_context,
-                &mut visitor,
-            )?,
+            (Some(projection), None) => {
+                projection.visit_projection_documents(budget, &self.task_context, &mut visitor)?
+            }
             (None, Some(projection)) => projection.reader().visit_projection_documents(
                 budget,
                 &self.task_context,
@@ -2730,16 +2777,19 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
                 .search_projection_durable_source_graph_commit_epoch,
             max_rows: self.budget.max_rows,
             max_payload_bytes: self.budget.max_payload_bytes,
-            cypher_statement_count: self.cypher_statement_count,
-            sql_statement_count: self.sql_statement_count,
+            cypher_statement_count: self.transaction.usage().cypher_statement_count,
+            sql_statement_count: self.transaction.usage().sql_statement_count,
             vector_seed_execution_count: self.external.vector_seed_execution_count,
-            output_rows: self.output_rows,
-            output_payload_bytes: self.output_payload_bytes,
-            remaining_rows: self.budget.max_rows.saturating_sub(self.output_rows),
+            output_rows: self.transaction.usage().output_rows,
+            output_payload_bytes: self.transaction.usage().output_payload_bytes,
+            remaining_rows: self
+                .budget
+                .max_rows
+                .saturating_sub(self.transaction.usage().output_rows),
             remaining_payload_bytes: self
                 .budget
                 .max_payload_bytes
-                .saturating_sub(self.output_payload_bytes),
+                .saturating_sub(self.transaction.usage().output_payload_bytes),
         }
     }
 
@@ -2749,7 +2799,10 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
                 "bounded read statement requires max_rows greater than zero".to_string(),
             ));
         }
-        let remaining = self.budget.max_rows.saturating_sub(self.output_rows);
+        let remaining = self
+            .budget
+            .max_rows
+            .saturating_sub(self.transaction.usage().output_rows);
         if remaining == 0 {
             return Err(HawDBError::read_budget_exceeded(
                 ReadBudgetResource::Rows,
@@ -2764,7 +2817,7 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
         let remaining = self
             .budget
             .max_payload_bytes
-            .saturating_sub(self.output_payload_bytes);
+            .saturating_sub(self.transaction.usage().output_payload_bytes);
         if remaining == 0 {
             return Err(HawDBError::read_budget_exceeded(
                 ReadBudgetResource::PayloadBytes,
@@ -2776,37 +2829,28 @@ impl<'a> NowledgeMemReadSnapshot<'a> {
     }
 
     fn consume(&mut self, rows: usize, payload_bytes: usize) -> Result<()> {
-        let output_rows = self.output_rows.saturating_add(rows);
-        let output_payload_bytes = self.output_payload_bytes.saturating_add(payload_bytes);
-        if output_rows > self.budget.max_rows {
-            return Err(HawDBError::read_budget_exceeded(
-                ReadBudgetResource::Rows,
-                self.budget.max_rows,
-                format!(
-                    "bounded read snapshot produced {output_rows} rows, exceeding max_rows {}",
-                    self.budget.max_rows
-                ),
-            ));
-        }
-        if output_payload_bytes > self.budget.max_payload_bytes {
-            return Err(HawDBError::read_budget_exceeded(ReadBudgetResource::PayloadBytes, self.budget.max_payload_bytes, format!(
-                "bounded read snapshot produced {output_payload_bytes} payload bytes, exceeding max_payload_bytes {}",
-                self.budget.max_payload_bytes
-            )));
-        }
-        self.output_rows = output_rows;
-        self.output_payload_bytes = output_payload_bytes;
-        Ok(())
+        self.transaction.consume_output(rows, payload_bytes)
     }
 }
 
 impl NowledgeMemEmbeddedStoreHandle {
     pub fn new(store: NowledgeMemEmbeddedStore) -> Result<Self> {
         let published_read = PublishedCanonicalRead::capture(&store)?;
+        let inner = Arc::new(crate::DatabasePublicationOwner::new(store));
+        let published_read = Arc::new(Mutex::new(Some(published_read)));
+        let read_publication_failed = Arc::new(AtomicBool::new(false));
+        let concurrent = crate::ConcurrentDatabase::with_shared_owner(Arc::new(
+            concurrent_owner::MemDatabaseOwner {
+                inner: Arc::clone(&inner),
+                published_read: Arc::clone(&published_read),
+                read_publication_failed: Arc::clone(&read_publication_failed),
+            },
+        ))?;
         Ok(Self {
-            inner: Arc::new(crate::DatabasePublicationOwner::new(store)),
-            published_read: Arc::new(Mutex::new(Some(published_read))),
-            read_publication_failed: Arc::new(AtomicBool::new(false)),
+            inner,
+            concurrent,
+            published_read,
+            read_publication_failed,
         })
     }
 
@@ -2826,6 +2870,12 @@ impl NowledgeMemEmbeddedStoreHandle {
             runtime_governor,
         )?;
         Ok((Self::new(store)?, report))
+    }
+
+    /// Qualification counters for the actual graph/projection publication owner.
+    #[cfg(feature = "qualification")]
+    pub fn publication_lock_metrics(&self) -> crate::PublicationLockMetricsSnapshot {
+        self.inner.lock_metrics()
     }
 
     pub fn runtime_governor_snapshot(&self) -> Result<RuntimeGovernorSnapshot> {
@@ -2890,7 +2940,7 @@ impl NowledgeMemEmbeddedStoreHandle {
     }
 
     pub fn query_with_report(&self, cypher: &str) -> Result<NowledgeMemQueryOutput> {
-        self.write_store()?.query_with_report(cypher)
+        self.query_with_params_with_report(cypher, &BTreeMap::new())
     }
 
     pub fn set_telemetry_sink(&self, telemetry: Option<Arc<dyn TelemetrySink>>) -> Result<()> {
@@ -2903,8 +2953,7 @@ impl NowledgeMemEmbeddedStoreHandle {
         cypher: &str,
         options: NowledgeMemQueryReportOptions,
     ) -> Result<NowledgeMemQueryOutput> {
-        self.write_store()?
-            .query_with_report_options(cypher, options)
+        self.query_with_params_with_report_options(cypher, &BTreeMap::new(), options)
     }
 
     pub fn query_with_params_with_report(
@@ -2912,8 +2961,11 @@ impl NowledgeMemEmbeddedStoreHandle {
         cypher: &str,
         parameters: &BTreeMap<String, Value>,
     ) -> Result<NowledgeMemQueryOutput> {
-        self.write_store()?
-            .query_with_params_with_report(cypher, parameters)
+        self.query_with_params_with_report_options(
+            cypher,
+            parameters,
+            NowledgeMemQueryReportOptions::default(),
+        )
     }
 
     /// Hydrates an explicitly bounded set of search-projection documents.
@@ -2942,105 +2994,7 @@ impl NowledgeMemEmbeddedStoreHandle {
                 document_ids.len()
             )));
         }
-        let _permit = self.admit_typed_search()?;
-        let store = self.read_store()?;
-        let max_payload_bytes = store
-            .graph
-            .database()
-            .config()
-            .max_read_result_payload_bytes
-            .ok_or_else(|| {
-                HawDBError::Execution(
-                    "admitted search hydration requires max_read_result_payload_bytes".to_string(),
-                )
-            })?;
-        match (
-            store.search_projection.as_ref(),
-            store.out_of_core_search_projection.as_ref(),
-        ) {
-            (Some(projection), None) => {
-                let mut documents = Vec::with_capacity(document_ids.len());
-                let mut payload_bytes = 0usize;
-                for id in document_ids {
-                    let Some(document) = projection.index().document(id) else {
-                        continue;
-                    };
-                    payload_bytes =
-                        payload_bytes.saturating_add(search_document_payload_bytes(document));
-                    if payload_bytes > max_payload_bytes {
-                        return Err(HawDBError::read_budget_exceeded(
-                            ReadBudgetResource::PayloadBytes,
-                            max_payload_bytes,
-                            format!(
-                                "search projection document hydration produced {payload_bytes} payload bytes, limit is {max_payload_bytes}"
-                            ),
-                        ));
-                    }
-                    documents.push(document.clone());
-                }
-                Ok(NowledgeMemSearchHydrationOutput {
-                    documents,
-                    out_of_core_metrics: None,
-                })
-            }
-            (None, Some(projection)) => {
-                let output = projection.hydrate_documents(document_ids)?;
-                if output.metrics.hydrated_bytes
-                    > u64::try_from(max_payload_bytes).unwrap_or(u64::MAX)
-                {
-                    return Err(HawDBError::read_budget_exceeded(
-                        ReadBudgetResource::PayloadBytes,
-                        max_payload_bytes,
-                        format!(
-                            "search projection document hydration produced {} payload bytes, limit is {max_payload_bytes}",
-                            output.metrics.hydrated_bytes
-                        ),
-                    ));
-                }
-                Ok(NowledgeMemSearchHydrationOutput {
-                    documents: output.documents,
-                    out_of_core_metrics: Some(output.metrics),
-                })
-            }
-            (None, None) => Err(missing_search_projection_error()),
-            (Some(_), Some(_)) => Err(ambiguous_search_projection_error()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl NowledgeMemEmbeddedStoreHandle {
-    pub fn create_knowledge_memory_evolves_batch(
-        &self,
-        request: &KnowledgeMemoryEvolvesCreateBatchRequest,
-    ) -> Result<KnowledgeMemoryEvolvesCreateBatchOutput> {
-        let _permit = self.admit_typed_mutation()?;
-        self.write_store()?
-            .graph_mut()
-            .database_mut()
-            .create_knowledge_memory_evolves_batch(request)
-    }
-
-    pub fn update_knowledge_memory_lifecycle_batch(
-        &self,
-        request: &KnowledgeMemoryLifecycleBatchRequest,
-    ) -> Result<KnowledgeMemoryLifecycleBatchOutput> {
-        let _permit = self.admit_typed_mutation()?;
-        self.write_store()?
-            .graph_mut()
-            .database_mut()
-            .update_knowledge_memory_lifecycle_batch(request)
-    }
-
-    pub fn delete_knowledge_entity_batch(
-        &self,
-        request: &KnowledgeEntityDeleteBatchRequest,
-    ) -> Result<KnowledgeEntityDeleteBatchOutput> {
-        let _permit = self.admit_typed_mutation()?;
-        self.write_store()?
-            .graph_mut()
-            .database_mut()
-            .delete_knowledge_entity_batch(request)
+        self.with_admitted_search(|read| read.hydrate(document_ids))
     }
 }
 
@@ -3050,11 +3004,12 @@ impl NowledgeMemEmbeddedStoreHandle {
         statements: &[NowledgeGraphStatement],
     ) -> Result<crate::NowledgeGraphTransactionOutput> {
         let permit = self.admit_transaction(statements)?;
-        let task_context = permit.bind_task_context(RuntimeTaskContext::default());
-        let _permit = permit;
-        let mut store = self.write_store()?;
-        let db = store.graph_mut().database_mut();
-        let mut transaction = db.begin_transaction_with_context(&task_context)?;
+        let _unwind = concurrent_owner::PublicationUnwindGuard(&self.read_publication_failed);
+        let mut transaction = self.concurrent.begin_admitted_transaction(
+            crate::ConcurrentTransactionOptions::default(),
+            permit,
+            RuntimeTaskContext::default(),
+        )?;
         let mut statement_outputs = Vec::with_capacity(statements.len());
         for statement in statements {
             statement_outputs
@@ -3075,25 +3030,22 @@ impl NowledgeMemEmbeddedStoreHandle {
     /// introduced. Returning an error rolls back every staged statement.
     pub fn with_transaction<T>(
         &self,
-        operation: impl FnOnce(&mut crate::DatabaseTransaction<'_>) -> Result<T>,
+        operation: impl FnOnce(&mut crate::ConcurrentDatabaseTransaction) -> Result<T>,
     ) -> Result<T> {
         let permit = self.admit_typed_transaction()?;
-        let task_context = permit.bind_task_context(RuntimeTaskContext::default());
-        let _permit = permit;
-        let mut store = self.write_store()?;
-        let mut transaction = store
-            .graph_mut()
-            .database_mut()
-            .begin_transaction_with_context(&task_context)?;
-        let result = match operation(&mut transaction) {
+        let _unwind = concurrent_owner::PublicationUnwindGuard(&self.read_publication_failed);
+        let mut transaction = self.concurrent.begin_admitted_transaction(
+            crate::ConcurrentTransactionOptions::default(),
+            permit,
+            RuntimeTaskContext::default(),
+        )?;
+        match operation(&mut transaction) {
             Ok(output) => transaction.commit().map(|_| output),
             Err(error) => {
                 transaction.rollback();
                 Err(error)
             }
-        };
-        store.graph.database().poison_on_storage_error(&result);
-        result
+        }
     }
 
     /// Executes a caller-owned group of bounded Cypher reads against one
@@ -3197,10 +3149,26 @@ impl NowledgeMemEmbeddedStoreHandle {
         let permit = self.admit_typed_read(budget.max_payload_bytes)?;
         let task_context = permit.bind_task_context(task_context.clone());
         let _permit = permit;
-        let store = self.read_store()?;
-        let configured_rows = store
-            .graph
-            .database()
+        let (view, identity, resident, projection) = {
+            let current = self.lock_published_read()?;
+            let current = current.as_ref().ok_or_else(|| {
+                HawDBError::StorageIntegrity("canonical read publication is unavailable".into())
+            })?;
+            (
+                Arc::clone(&current.view),
+                current.instance_identity.clone(),
+                current.resident_projection.clone(),
+                current
+                    .out_of_core_projection
+                    .as_ref()
+                    .map(NowledgeMemOutOfCoreSearchProjection::read_snapshot),
+            )
+        };
+        let resident = resident
+            .map(|snapshot| snapshot.retain_with_permit(&_permit))
+            .transpose()?;
+        let configured_rows = view
+            .snapshot
             .config()
             .read_result_row_limit()
             .unwrap_or(usize::MAX);
@@ -3210,19 +3178,19 @@ impl NowledgeMemEmbeddedStoreHandle {
                 budget.max_rows
             )));
         }
-        let transaction = store
-            .graph
-            .database()
-            .begin_read_transaction_with_context(&task_context)?;
+        let transaction = view.begin_read_transaction_with_context(&task_context)?;
+        drop(view);
         let mut snapshot = NowledgeMemReadSnapshot::new(
             transaction,
-            store.graph.database().instance_identity()?,
+            identity,
             budget,
-            store.search_projection.as_ref(),
-            store.out_of_core_search_projection.as_ref(),
+            resident
+                .as_ref()
+                .map(|lease| ResidentProjectionRef::Snapshot(lease.snapshot())),
+            projection.as_ref(),
             task_context,
         );
-        operation(&mut snapshot)
+        self.finish_canonical_read(operation(&mut snapshot))
     }
 
     pub fn hawdb_lightning_initial_import_apply_with_document_identities(
@@ -3306,8 +3274,12 @@ impl NowledgeMemEmbeddedStoreHandle {
         parameters: &BTreeMap<String, Value>,
         options: NowledgeMemQueryReportOptions,
     ) -> Result<NowledgeMemQueryOutput> {
-        self.write_store()?
-            .query_with_params_with_report_options(cypher, parameters, options)
+        self.query_with_params_with_report_options_context(
+            cypher,
+            parameters,
+            options,
+            &RuntimeTaskContext::default(),
+        )
     }
 
     pub fn query_with_params_with_report_options_context(
@@ -3317,13 +3289,7 @@ impl NowledgeMemEmbeddedStoreHandle {
         options: NowledgeMemQueryReportOptions,
         task_context: &RuntimeTaskContext,
     ) -> Result<NowledgeMemQueryOutput> {
-        self.write_store()?
-            .query_with_params_with_report_options_context(
-                cypher,
-                parameters,
-                options,
-                task_context,
-            )
+        self.query_with_admitted_report(cypher, parameters, options, task_context)
     }
 
     pub fn read_query(
@@ -3331,7 +3297,7 @@ impl NowledgeMemEmbeddedStoreHandle {
         cypher: &str,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        self.read_store()?.read_query_with_options(cypher, options)
+        self.read_query_with_params(cypher, &BTreeMap::new(), options)
     }
 
     pub fn read_query_with_params(
@@ -3340,8 +3306,11 @@ impl NowledgeMemEmbeddedStoreHandle {
         parameters: &BTreeMap<String, Value>,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        self.read_store()?
-            .read_query_with_params(cypher, parameters, options)
+        let mut output = self
+            .read_query_with_params_streaming_collect(cypher, parameters, options)
+            .map_err(|error| legacy_nowledge_mem_read_error(error, options))?;
+        output.report.streaming = false;
+        Ok(output)
     }
 
     pub fn read_query_with_params_streaming(
@@ -3351,8 +3320,13 @@ impl NowledgeMemEmbeddedStoreHandle {
         options: &NowledgeMemReadOptions,
         consumer: impl FnMut(BTreeMap<String, Value>) -> Result<()>,
     ) -> Result<QueryStreamReport> {
-        self.read_store()?
-            .read_query_with_params_streaming(cypher, parameters, options, consumer)
+        self.read_query_with_params_streaming_context(
+            cypher,
+            parameters,
+            options,
+            &RuntimeTaskContext::default(),
+            consumer,
+        )
     }
 
     pub fn read_query_with_params_streaming_context(
@@ -3363,12 +3337,21 @@ impl NowledgeMemEmbeddedStoreHandle {
         task_context: &RuntimeTaskContext,
         consumer: impl FnMut(BTreeMap<String, Value>) -> Result<()>,
     ) -> Result<QueryStreamReport> {
-        self.read_store()?.read_query_with_params_streaming_context(
+        self.with_admitted_graph_read(
             cypher,
             parameters,
             options,
             task_context,
-            consumer,
+            |read, prepared, limits, context, _| {
+                read.query_prepared_with_params_streaming_context(
+                    prepared,
+                    parameters,
+                    limits,
+                    crate::executor::StreamDelivery::Validated,
+                    context,
+                    consumer,
+                )
+            },
         )
     }
 
@@ -3378,15 +3361,40 @@ impl NowledgeMemEmbeddedStoreHandle {
         parameters: &BTreeMap<String, Value>,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        self.read_store()?
-            .read_query_with_params_streaming_collect(cypher, parameters, options)
+        self.with_admitted_graph_read(
+            cypher,
+            parameters,
+            options,
+            &RuntimeTaskContext::default(),
+            |read, prepared, limits, context, mode| {
+                let bounded = read.query_prepared_with_params_profiled_context(
+                    prepared, parameters, limits, context,
+                )?;
+                let mut output = bounded_nowledge_mem_read_output(mode, bounded, options)?;
+                output.report.streaming = true;
+                Ok(output)
+            },
+        )
     }
 
     pub fn graph_rag_schema_context(
         &self,
         options: GraphRagSchemaContextOptions,
     ) -> Result<GraphRagSchemaContext> {
-        self.read_store()?.graph_rag_schema_context(options)
+        let view = {
+            let publication = self.lock_published_read()?;
+            let publication = publication.as_ref().ok_or_else(|| {
+                HawDBError::Execution("embedded schema source is unavailable".into())
+            })?;
+            Arc::clone(&publication.view)
+        };
+        // Schema guidance is metadata, not an executable query. Preserve its
+        // existing options while constructing statistics outside publication.
+        let read = view
+            .snapshot
+            .begin_read_transaction(&RuntimeTaskContext::default())?;
+        drop(view);
+        self.finish_canonical_read(Ok(read.graph_rag_schema_context(options)))
     }
 
     pub fn read_generated_graph_rag(
@@ -3395,8 +3403,22 @@ impl NowledgeMemEmbeddedStoreHandle {
         parameters: &BTreeMap<String, Value>,
         options: &NowledgeMemReadOptions,
     ) -> Result<NowledgeMemReadOutput> {
-        self.read_store()?
-            .read_generated_graph_rag(query, parameters, options)
+        query
+            .validate_parameters(parameters)
+            .map_err(|error| HawDBError::Semantic(error.to_string()))?;
+        self.with_admitted_graph_read(
+            query.cypher(),
+            parameters,
+            options,
+            &RuntimeTaskContext::default(),
+            |read, prepared, limits, context, mode| {
+                read.validate_generated_graph_rag(query, parameters)?;
+                let bounded = read.query_prepared_with_params_profiled_context(
+                    prepared, parameters, limits, context,
+                )?;
+                bounded_nowledge_mem_read_output(mode, bounded, options)
+            },
+        )
     }
 }
 impl NowledgeMemEmbeddedStoreHandle {
@@ -3404,16 +3426,14 @@ impl NowledgeMemEmbeddedStoreHandle {
         &self,
         request: &NowledgeMemSearchCandidateRequest,
     ) -> Result<SearchResultSet> {
-        let _permit = self.admit_typed_search()?;
-        Ok(self.read_store()?.search_candidates(request)?.result)
+        Ok(self.search_candidates_with_report(request)?.result)
     }
 
     pub fn search_candidates_with_report(
         &self,
         request: &NowledgeMemSearchCandidateRequest,
     ) -> Result<NowledgeMemSearchCandidateOutput> {
-        let _permit = self.admit_typed_search()?;
-        self.read_store()?.search_candidates(request)
+        self.with_admitted_search(|read| read.search_candidates(request))
     }
 
     pub fn validate_sampled_vector_recall(
@@ -3441,16 +3461,14 @@ impl NowledgeMemEmbeddedStoreHandle {
         &self,
         request: &KnowledgeRetrievalRequest,
     ) -> Result<KnowledgeRetrievalOutput> {
-        let _permit = self.admit_typed_search()?;
-        self.read_store()?.retrieve_knowledge(request)
+        Ok(self.retrieve_knowledge_with_report(request)?.output)
     }
 
     pub fn retrieve_knowledge_with_report(
         &self,
         request: &KnowledgeRetrievalRequest,
     ) -> Result<NowledgeMemRetrievalOutput> {
-        let _permit = self.admit_typed_search()?;
-        self.read_store()?.retrieve_knowledge_with_report(request)
+        self.with_admitted_search(|read| read.retrieve(request))
     }
 
     pub fn search_candidate_readiness(
@@ -3458,9 +3476,9 @@ impl NowledgeMemEmbeddedStoreHandle {
         request: &NowledgeMemSearchCandidateRequest,
         options: &NowledgeMemSearchCandidateReadinessOptions,
     ) -> Result<NowledgeMemSearchCandidateReadinessReport> {
-        let _permit = self.admit_typed_search()?;
-        self.read_store()?
-            .search_candidate_readiness(request, options)
+        Ok(self
+            .search_candidates_with_report(request)?
+            .readiness_report(options))
     }
 
     pub fn search_candidate_shadow_evidence_json<I, S>(
@@ -3472,9 +3490,7 @@ impl NowledgeMemEmbeddedStoreHandle {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let _permit = self.admit_typed_search()?;
-        self.read_store()?
-            .search_candidate_shadow_evidence_json(request, primary_candidate_ids)
+        self.with_admitted_search(|read| read.shadow_evidence_json(request, primary_candidate_ids))
     }
 
     pub fn slow_query_report(&self) -> Result<NowledgeMemSlowQueryReport> {
@@ -3497,28 +3513,37 @@ impl NowledgeMemEmbeddedStoreHandle {
     pub fn production_resource_profile(
         &self,
         statement: &NowledgeGraphStatement,
-        limits: StorageResourceProfileLimits,
+        mut limits: StorageResourceProfileLimits,
         evidence_binding: crate::ProductionEvidenceBinding,
         expected_identity: crate::ProductionQualificationIdentity,
     ) -> Result<StorageResourceProfileReport> {
-        let store = self.read_store()?;
-        let permit = store.graph.admit_streaming_query(
+        limits.validate()?;
+        evidence_binding.validate_for(&expected_identity)?;
+        self.with_admitted_graph_read(
             &statement.cypher,
             &statement.parameters,
-            limits.max_output_payload_bytes,
-        )?;
-        let task_context = permit.bind_task_context(RuntimeTaskContext::default());
-        store
-            .graph
-            .database()
-            .storage_resource_profile_for_production_with_context(
-                &statement.cypher,
-                &statement.parameters,
-                limits,
-                evidence_binding,
-                expected_identity,
-                &task_context,
-            )
+            &NowledgeMemReadOptions {
+                max_rows: Some(limits.max_output_rows),
+                max_estimated_payload_bytes: Some(limits.max_output_payload_bytes),
+            },
+            &RuntimeTaskContext::default(),
+            |read, prepared, admitted, context, _| {
+                limits.max_output_rows = limits
+                    .max_output_rows
+                    .min(admitted.max_rows.unwrap_or(usize::MAX));
+                limits.max_output_payload_bytes = limits
+                    .max_output_payload_bytes
+                    .min(admitted.max_payload_bytes.unwrap_or(usize::MAX));
+                read.storage_resource_profile_for_production_with_context(
+                    prepared,
+                    &statement.parameters,
+                    limits,
+                    evidence_binding,
+                    expected_identity,
+                    context,
+                )
+            },
+        )
     }
 
     pub fn production_status(
@@ -3825,49 +3850,54 @@ impl NowledgeMemEmbeddedStoreHandle {
             .catch_up_search_projection_scheduled(max_operations_per_batch, max_batches)
     }
 
-    #[cfg(test)]
-    fn admit_typed_mutation(&self) -> Result<RuntimePermit> {
-        let store = self.read_store()?;
-        let config = store.graph.database().config();
-        let estimated_memory_bytes = crate::executor::estimated_mutation_memory_bytes(
-            config.mutation_limits,
-            config.max_wal_record_bytes,
-        );
-        store
-            .graph
-            .try_admit_runtime(RuntimeWorkRequest::foreground_mutation(
-                estimated_memory_bytes,
-            ))
-    }
-
     fn admit_typed_transaction(&self) -> Result<RuntimePermit> {
-        let store = self.read_store()?;
-        let config = store.graph.database().config();
-        let memory_bytes = crate::executor::estimated_mutation_memory_bytes(
-            config.mutation_limits,
-            config.max_wal_record_bytes,
-        )
-        .max(u64::try_from(config.execution_memory.query_memory_bytes.get()).unwrap_or(u64::MAX));
-        let result_bytes = u64::try_from(
-            config
-                .max_read_result_payload_bytes
-                .unwrap_or(config.mutation_limits.max_result_payload_bytes.get()),
-        )
-        .unwrap_or(u64::MAX);
-        store.graph.try_admit_runtime(
-            RuntimeWorkRequest::new(RuntimeWorkPriority::Foreground, RuntimeWorkKind::Mutation)
-                .with_cpu_slots(1)
-                .with_memory_bytes(memory_bytes)
-                .with_result_bytes(result_bytes)
-                .with_blocking(true),
-        )
+        let (governor, request) = {
+            let published = self.lock_published_read()?;
+            let published = published.as_ref().ok_or_else(|| {
+                HawDBError::StorageIntegrity("canonical read publication is unavailable".into())
+            })?;
+            let config = published.view.snapshot.config();
+            let memory_bytes = crate::executor::estimated_mutation_memory_bytes(
+                config.mutation_limits,
+                config.max_wal_record_bytes,
+            )
+            .max(
+                u64::try_from(config.execution_memory.query_memory_bytes.get()).unwrap_or(u64::MAX),
+            );
+            let result_bytes = u64::try_from(
+                config
+                    .max_read_result_payload_bytes
+                    .unwrap_or(config.mutation_limits.max_result_payload_bytes.get()),
+            )
+            .unwrap_or(u64::MAX);
+            (
+                published.governor.clone(),
+                RuntimeWorkRequest::new(RuntimeWorkPriority::Foreground, RuntimeWorkKind::Mutation)
+                    .with_cpu_slots(1)
+                    .with_memory_bytes(memory_bytes)
+                    .with_result_bytes(result_bytes)
+                    .with_blocking(true),
+            )
+        };
+        try_admit_runtime(&governor, request)
     }
 
     fn admit_typed_read(&self, max_estimated_payload_bytes: usize) -> Result<RuntimePermit> {
-        let store = self.read_store()?;
-        let request =
-            typed_read_request(store.graph.database().config(), max_estimated_payload_bytes)?;
-        store.graph.try_admit_runtime(request)
+        let (governor, request) = {
+            let publication = self.lock_published_read()?;
+            let publication = publication.as_ref().ok_or_else(|| {
+                HawDBError::StorageIntegrity("canonical read publication is unavailable".into())
+            })?;
+            publication.view.snapshot.ensure_usable()?;
+            (
+                publication.governor.clone(),
+                typed_read_request(
+                    publication.view.snapshot.config(),
+                    max_estimated_payload_bytes,
+                )?,
+            )
+        };
+        try_admit_runtime(&governor, request)
     }
 
     fn lock_published_read(&self) -> Result<MutexGuard<'_, Option<PublishedCanonicalRead>>> {
@@ -3927,10 +3957,13 @@ impl NowledgeMemEmbeddedStoreHandle {
             let published = published.as_ref().ok_or_else(|| {
                 HawDBError::Execution("nowledge mem embedded store read lock poisoned".to_string())
             })?;
-            published.snapshot.ensure_usable()?;
+            published.view.snapshot.ensure_usable()?;
             (
                 published.governor.clone(),
-                typed_read_request(published.snapshot.config(), max_estimated_payload_bytes)?,
+                typed_read_request(
+                    published.view.snapshot.config(),
+                    max_estimated_payload_bytes,
+                )?,
             )
         };
         let permit = governor.try_admit(request).map_err(|error| {
@@ -3940,13 +3973,19 @@ impl NowledgeMemEmbeddedStoreHandle {
             HawDBError::Execution(error.to_string())
         })?;
         // Capture after admission so a write completed during admission is visible.
-        // This guard must also drop before the permit on every error path.
-        let published = self.lock_published_read()?;
-        let published = published.as_ref().ok_or_else(|| {
-            HawDBError::Execution("nowledge mem embedded store read lock poisoned".to_string())
-        })?;
-        published.snapshot.ensure_usable()?;
-        let config = published.snapshot.config();
+        // Snapshot construction and observation refresh run after unlocking.
+        let (view, identity) = {
+            let published = self.lock_published_read()?;
+            let published = published.as_ref().ok_or_else(|| {
+                HawDBError::Execution("nowledge mem embedded store read lock poisoned".to_string())
+            })?;
+            (
+                Arc::clone(&published.view),
+                published.instance_identity.clone(),
+            )
+        };
+        view.snapshot.ensure_usable()?;
+        let config = view.snapshot.config();
         if let Some(max_rows) = max_rows {
             let configured_rows = config.read_result_row_limit().unwrap_or(usize::MAX);
             if max_rows > configured_rows {
@@ -3956,8 +3995,8 @@ impl NowledgeMemEmbeddedStoreHandle {
             }
         }
         let task_context = permit.bind_task_context(task_context.clone());
-        let transaction = published.snapshot.begin_read_transaction(&task_context)?;
-        Ok((permit, transaction, published.instance_identity.clone()))
+        let transaction = view.begin_read_transaction_with_context(&task_context)?;
+        Ok((permit, transaction, identity))
     }
 
     fn finish_canonical_read<T>(&self, result: Result<T>) -> Result<T> {
@@ -3966,7 +4005,7 @@ impl NowledgeMemEmbeddedStoreHandle {
             let published = published.as_ref().ok_or_else(|| {
                 HawDBError::Execution("nowledge mem embedded store read lock poisoned".to_string())
             })?;
-            published.snapshot.ensure_usable()?;
+            published.view.snapshot.ensure_usable()?;
         }
         result
     }
@@ -3992,41 +4031,11 @@ impl NowledgeMemEmbeddedStoreHandle {
         )
     }
 
-    fn admit_typed_search(&self) -> Result<RuntimePermit> {
-        let store = self.read_store()?;
-        let config = store.graph.database().config();
-        let result_bytes = config
-            .max_read_result_payload_bytes
-            .ok_or_else(|| {
-                HawDBError::Execution(
-                    "admitted typed search requires max_read_result_payload_bytes".to_string(),
-                )
-            })
-            .and_then(|bytes| {
-                u64::try_from(bytes).map_err(|_| {
-                    HawDBError::Execution(
-                        "admitted typed search result budget exceeds u64".to_string(),
-                    )
-                })
-            })?;
-        let working_memory_bytes =
-            u64::try_from(config.execution_memory.blocking_operator_bytes.get())
-                .unwrap_or(u64::MAX);
-        let memory_bytes = store.search_memory_bytes(working_memory_bytes, result_bytes)?;
-        let io_slots = store.search_io_slots()?;
-        store.graph.try_admit_runtime(
-            RuntimeWorkRequest::foreground_query(memory_bytes, result_bytes)
-                .with_io_slots(io_slots)
-                .with_blocking(true),
-        )
-    }
-
     fn admit_transaction(&self, statements: &[NowledgeGraphStatement]) -> Result<RuntimePermit> {
         let store = self.read_store()?;
         let db = store.graph.database();
         let config = db.config();
         let mut priority = RuntimeWorkPriority::Background;
-        let mut kind = RuntimeWorkKind::Query;
         let mut estimated_memory_bytes = TYPED_CONTROL_STATEMENT_MEMORY_BYTES;
         let mut result_bytes = 0u64;
         let mut io_slots = 0usize;
@@ -4034,9 +4043,6 @@ impl NowledgeMemEmbeddedStoreHandle {
             let admission = db.runtime_admission_plan(&statement.cypher, &statement.parameters)?;
             if admission.work_request.priority == WorkPriority::Foreground {
                 priority = RuntimeWorkPriority::Foreground;
-            }
-            if admission.is_mutation {
-                kind = RuntimeWorkKind::Mutation;
             }
             estimated_memory_bytes = estimated_memory_bytes.max(admission.estimated_memory_bytes);
             io_slots = io_slots.max(admission.required_io_slots);
@@ -4052,7 +4058,7 @@ impl NowledgeMemEmbeddedStoreHandle {
             result_bytes = result_bytes
                 .saturating_add(u64::try_from(statement_result_bytes).unwrap_or(u64::MAX));
         }
-        let request = RuntimeWorkRequest::new(priority, kind)
+        let request = RuntimeWorkRequest::new(priority, RuntimeWorkKind::Mutation)
             .with_cpu_slots(1)
             .with_memory_bytes(estimated_memory_bytes)
             .with_io_slots(io_slots)
@@ -4061,22 +4067,50 @@ impl NowledgeMemEmbeddedStoreHandle {
         store.graph.try_admit_runtime(request)
     }
 
-    fn read_store(&self) -> Result<RwLockReadGuard<'_, NowledgeMemEmbeddedStore>> {
+    fn read_store(
+        &self,
+    ) -> Result<crate::api::publication::DatabasePublicationReadGuard<'_, NowledgeMemEmbeddedStore>>
+    {
         self.inner.read().map_err(|_| {
             HawDBError::Execution("nowledge mem embedded store read lock poisoned".to_string())
         })
     }
 
     fn write_store(&self) -> Result<EmbeddedStoreWriteGuard<'_>> {
+        if self.read_publication_failed.load(Ordering::Acquire) {
+            return Err(HawDBError::StorageIntegrity(
+                "canonical read publication is poisoned".into(),
+            ));
+        }
+        let exclusive = self.concurrent.exclusive_database_lease()?;
         let store = self.inner.write().map_err(|_| {
             HawDBError::Execution("nowledge mem embedded store write lock poisoned".to_string())
         })?;
+        if self.read_publication_failed.load(Ordering::Acquire) {
+            return Err(HawDBError::StorageIntegrity(
+                "canonical read publication is poisoned".into(),
+            ));
+        }
         Ok(EmbeddedStoreWriteGuard {
             store,
+            _exclusive: Some(exclusive),
+            retired: None,
             published: &self.published_read,
             read_publication_failed: &self.read_publication_failed,
         })
     }
+}
+
+fn try_admit_runtime(
+    governor: &RuntimeGovernor,
+    request: RuntimeWorkRequest,
+) -> Result<RuntimePermit> {
+    governor.try_admit(request).map_err(|error| {
+        if error.is_retryable() {
+            governor.record_admission_wait(request, error.code, 0);
+        }
+        HawDBError::Execution(error.to_string())
+    })
 }
 
 fn typed_read_request(
@@ -4909,7 +4943,7 @@ impl NowledgeMemEmbeddedStore {
             ..
         } = self;
         let mut external = SearchProjectionExternalReadOperator {
-            projection: search_projection.as_ref(),
+            projection: search_projection.as_ref().map(ResidentProjectionRef::Live),
             out_of_core_projection: out_of_core_search_projection.as_ref(),
             vector_seed_execution_count: 0,
         };
@@ -4935,7 +4969,7 @@ impl NowledgeMemEmbeddedStore {
             ..
         } = self;
         let mut external = SearchProjectionExternalReadOperator {
-            projection: search_projection.as_ref(),
+            projection: search_projection.as_ref().map(ResidentProjectionRef::Live),
             out_of_core_projection: out_of_core_search_projection.as_ref(),
             vector_seed_execution_count: 0,
         };
@@ -5313,54 +5347,24 @@ impl NowledgeMemEmbeddedStore {
         }
     }
 
-    fn search_io_slots(&self) -> Result<usize> {
-        match (
-            self.search_projection.as_ref(),
-            self.out_of_core_search_projection.as_ref(),
-        ) {
-            (Some(projection), None) => Ok(projection.index().range_read_config().io_depth.get()),
-            (None, Some(_)) => Ok(1),
-            (None, None) => Err(missing_search_projection_error()),
-            (Some(_), Some(_)) => Err(ambiguous_search_projection_error()),
-        }
-    }
-
-    fn search_memory_bytes(
-        &self,
-        working_memory_bytes: u64,
-        result_budget_bytes: u64,
-    ) -> Result<u64> {
-        match (
-            self.search_projection.as_ref(),
-            self.out_of_core_search_projection.as_ref(),
-        ) {
-            (Some(_), None) => Ok(working_memory_bytes),
-            (None, Some(projection)) => Ok(projection
-                .runtime_admission_memory_bytes(working_memory_bytes, result_budget_bytes)),
-            (None, None) => Err(missing_search_projection_error()),
-            (Some(_), Some(_)) => Err(ambiguous_search_projection_error()),
-        }
+    fn external_seed_io_slots(&self) -> usize {
+        self.search_projection
+            .as_ref()
+            .map_or(0, |projection| {
+                projection.index().range_read_config().io_depth.get()
+            })
+            .max(usize::from(self.out_of_core_search_projection.is_some()))
     }
 
     fn search_request_for_retrieval(
         &self,
         request: &KnowledgeRetrievalRequest,
     ) -> NowledgeMemSearchCandidateRequest {
-        let config = self.graph.database().config();
-        NowledgeMemSearchCandidateRequest {
-            query_text: request.query_text.clone(),
-            query_embedding: request.query_embedding.clone(),
-            mode: request.mode,
-            limit: request.limit,
-            offset: request.offset,
-            rank_window: request.rank_window,
-            fusion_weights: request.search_fusion_weights,
-            metadata_filters: request.metadata_filters.clone(),
-            compressed_vector_search_mode: config.compressed_vector_search_mode,
-            adaptive_vector_backend_policy: config.adaptive_vector_backend_policy,
-            recall_validation_probe: false,
-            retrieval_projection_advisor: self.retrieval_projection_advisor.clone(),
-        }
+        search_read::retrieval_request(
+            self.graph.database().config(),
+            &self.retrieval_projection_advisor,
+            request,
+        )
     }
 
     fn require_search_projection(&self) -> Result<&NowledgeMemSearchProjection> {
@@ -6040,23 +6044,6 @@ fn bounded_nowledge_mem_read_output(
         output: bounded.output,
         report,
     })
-}
-
-fn streamed_nowledge_mem_read_output(
-    mode: NowledgeMemGraphMode,
-    rows: Vec<BTreeMap<String, Value>>,
-    streamed: QueryStreamReport,
-    options: &NowledgeMemReadOptions,
-) -> Result<NowledgeMemReadOutput> {
-    let output = QueryOutput { rows: rows.into() };
-    let mut report = nowledge_mem_read_report(mode, &output, options, &streamed.execution_profile);
-    report.streaming = true;
-    debug_assert_eq!(report.row_count, streamed.output_rows);
-    debug_assert_eq!(
-        report.estimated_payload_bytes,
-        streamed.output_payload_bytes
-    );
-    Ok(NowledgeMemReadOutput { output, report })
 }
 
 fn legacy_nowledge_mem_read_error(
@@ -7238,8 +7225,9 @@ mod tests {
 
         assert_eq!(read.output.rows.len(), 1);
         let snapshot = graph.runtime_governor_snapshot();
-        assert_eq!(snapshot.admissions, 2);
-        assert_eq!(snapshot.completions, 2);
+        // Each statement admits preparation and execution separately.
+        assert_eq!(snapshot.admissions, 4);
+        assert_eq!(snapshot.completions, 4);
         assert_eq!(snapshot.active_foreground_tasks, 0);
         assert_eq!(snapshot.active_cpu_slots, 0);
         assert_eq!(snapshot.admitted_memory_bytes, 0);
@@ -13330,6 +13318,100 @@ mod tests {
     }
 
     #[test]
+    fn incremental_refresh_retries_after_descriptor_pressure_without_reopen() {
+        let root = unique_nowledge_mem_test_dir("incremental_refresh_fd_retry");
+        let search_path = root.join("search");
+        let files =
+            hawdb_storage::file_descriptors::ProjectFileDescriptors::acquire_with_capacity_limit(
+                &search_path,
+                64,
+                true,
+            )
+            .unwrap();
+        let mut index = SearchIndex::open(&search_path).unwrap();
+        index
+            .upsert_projection_row(SearchProjectionRow {
+                kind: SearchProjectionKind::Memory,
+                external_id: "a".into(),
+                title: "original".into(),
+                body: "original".into(),
+                embedding: None,
+                source_id: None,
+                metadata: BTreeMap::new(),
+            })
+            .unwrap();
+        index.checkpoint().unwrap();
+        drop(index);
+        let options = super::NowledgeMemOpenOptions::with_search_projection(
+            root.join("graph"),
+            search_path,
+            NowledgeMemGraphMode::WritableCutover,
+        )
+        .with_incremental_search_maintenance(Default::default());
+        let (handle, _) = NowledgeMemEmbeddedStoreHandle::open_with_options(options).unwrap();
+        let pinned = handle
+            .lock_published_read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .out_of_core_projection
+            .as_ref()
+            .unwrap()
+            .read_snapshot();
+        let (held_tx, held_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let pressured_files = files.clone();
+        let pressure = thread::spawn(move || {
+            // Reservations are borrowed by nested IO on the reserving thread.
+            // Hold pressure elsewhere so refresh cannot consume these slots.
+            let metrics = pressured_files.metrics();
+            let _reservation = pressured_files
+                .reserve(metrics.limit - metrics.open - metrics.reserved)
+                .unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let result = handle.catch_up_search_projection_with_batch_hydrator(4, 4, 1, |_, _| {
+            Ok(SearchProjectionRelationalDelta::default())
+        });
+        release_tx.send(()).unwrap();
+        pressure.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                HawDBError::FileDescriptors(crate::FileDescriptorError::BudgetExceeded { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            pinned
+                .hydrate_documents(&["memory:a".into()])
+                .unwrap()
+                .documents[0]
+                .title,
+            "original"
+        );
+        drop(pinned);
+        handle
+            .query_with_report("CREATE (:Memory {id: 'm', title: 'Recovered'})")
+            .unwrap();
+        handle
+            .catch_up_search_projection_with_batch_hydrator(4, 4, 1, |_, _| {
+                Ok(SearchProjectionRelationalDelta::default())
+            })
+            .unwrap();
+        let output = handle
+            .search_projection_documents(&["memory:m".into()], 1)
+            .unwrap();
+        assert_eq!(output[0].title, "Recovered");
+        drop(handle);
+        drop(files);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn incremental_maintenance_budget_failure_does_not_advance_the_watermark() {
         let maintenance = super::NowledgeMemIncrementalSearchMaintenanceOptions {
             working_memory_bytes: std::num::NonZeroU64::new(1).unwrap(),
@@ -13550,7 +13632,7 @@ mod tests {
             (None, Some(&disk)),
         ] {
             let mut external = super::SearchProjectionExternalReadOperator {
-                projection,
+                projection: projection.map(super::ResidentProjectionRef::Live),
                 out_of_core_projection,
                 vector_seed_execution_count: 0,
             };
@@ -13746,7 +13828,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut external = super::SearchProjectionExternalReadOperator {
-                projection: projection.as_ref(),
+                projection: projection.as_ref().map(super::ResidentProjectionRef::Live),
                 out_of_core_projection: out_of_core_projection.as_ref(),
                 vector_seed_execution_count: 0,
             };

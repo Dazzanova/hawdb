@@ -93,9 +93,27 @@ pub(super) fn execute_profiled_consumer<S: ExecutionStore>(
     .map(|(streamed, _)| streamed)
 }
 
+pub(super) fn execute_profiled_borrowed_consumer<'consumer, S: ExecutionStore>(
+    request: ExecutionRequest<'_>,
+    resources: ExecutionResources<'_, S>,
+    delivery: StreamDelivery,
+    consumer: &'consumer mut hawdb_executor::result_delivery::BorrowedRowConsumer<'consumer>,
+) -> Result<ProfiledQueryStream> {
+    execute_profiled_output(
+        request,
+        resources,
+        OutputTarget::Borrowed(delivery, consumer),
+    )
+    .map(|(streamed, _)| streamed)
+}
+
 enum OutputTarget<'a> {
     Owned,
     Consumer(ConsumerMemoryMode, &'a mut dyn FnMut(Row) -> Result<()>),
+    Borrowed(
+        StreamDelivery,
+        &'a mut hawdb_executor::result_delivery::BorrowedRowConsumer<'a>,
+    ),
 }
 
 fn execute_profiled_output<S: ExecutionStore>(
@@ -127,6 +145,16 @@ fn execute_profiled_output<S: ExecutionStore>(
                 &memory_ledger,
                 budget_option,
                 output_memory,
+                consumer,
+            )?
+        }
+        OutputTarget::Borrowed(delivery, consumer) => {
+            QueryOutputAccumulator::new_borrowed_with_budget_option(
+                output_limits,
+                result_memory_budget,
+                &memory_ledger,
+                budget_option,
+                delivery,
                 consumer,
             )?
         }
@@ -179,17 +207,30 @@ fn execute_profiled_output<S: ExecutionStore>(
             observer: context.observer,
             host_scorer: context.host_scorer,
         };
-        execute_prepared_binding_batches(
-            batch_plan,
-            batch_context,
+        let native = hawdb_executor::numeric::try_stream_native_projection(
+            batch_plan.plan(),
+            batch_context.numeric_context(),
             execution_limit,
-            &mut |batch| {
-                for binding in batch {
-                    output.emit(binding)?;
-                }
+            &mut |row| {
+                output.emit_borrowed(row)?;
                 Ok(BatchControl::Continue)
             },
-        )?;
+        );
+        if let Some(result) = native {
+            result?;
+        } else {
+            execute_prepared_binding_batches(
+                batch_plan,
+                batch_context,
+                execution_limit,
+                &mut |batch| {
+                    for binding in batch {
+                        output.emit(binding)?;
+                    }
+                    Ok(BatchControl::Continue)
+                },
+            )?;
+        }
     } else {
         observer.record_operator_start(plan);
         let bindings =

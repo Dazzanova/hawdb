@@ -14,26 +14,31 @@
 
 use super::super::{
     observability::StatementRecorder, Database, DatabaseReadSnapshot, DatabaseReadTransaction,
-    PlanCache, PreparedRuntimeQuery, QuerySystemVariables, SharedState,
+    PlanCache, PreparedRuntimeQuery, SharedState,
 };
-use crate::{QueryOutput, Result, Value};
-use std::collections::BTreeMap;
+#[cfg(test)]
+use crate::Value;
+use crate::{QueryOutput, Result};
 use std::sync::Arc;
 
-pub(super) struct PublishedConcurrentRead {
-    pub(super) snapshot: DatabaseReadSnapshot,
+pub(crate) struct PublishedConcurrentRead {
+    pub(crate) snapshot: DatabaseReadSnapshot,
     pub(super) recorder: StatementRecorder,
-    system_variables: QuerySystemVariables,
     plan_cache: Arc<SharedState<PlanCache>>,
 }
 
 impl PublishedConcurrentRead {
-    pub(super) fn capture(database: &Database) -> Result<Self> {
+    pub(crate) fn capture(database: &Database) -> Result<Self> {
         let runtime = database.runtime.get()?;
+        if runtime.store.wal_sync_group_active() {
+            return Err(crate::HawDBError::StorageIntegrity(
+                "cannot publish a read view before the WAL group durability barrier".into(),
+            ));
+        }
+        runtime.store.ensure_usable()?;
         Ok(Self {
             snapshot: database.read_snapshot_without_observations()?,
             recorder: database.statement_recorder(),
-            system_variables: database.system_variables.clone(),
             plan_cache: Arc::clone(&runtime.plan_cache),
         })
     }
@@ -45,10 +50,18 @@ impl PublishedConcurrentRead {
         Ok(snapshot)
     }
 
+    pub(crate) fn begin_read_transaction_with_context(
+        &self,
+        context: &hawdb_core::RuntimeTaskContext,
+    ) -> Result<DatabaseReadTransaction> {
+        let mut snapshot = self.snapshot.begin_read_transaction(context)?;
+        self.recorder.refresh_read_snapshot(&mut snapshot);
+        Ok(snapshot)
+    }
+
     pub(super) fn query_sql(
         &self,
-        sql_text: &str,
-        parameters: &[Value],
+        request: crate::SqlQueryRequest<'_>,
         prepared: crate::relational_sql::PreparedRelationalSql,
     ) -> Result<QueryOutput> {
         if matches!(
@@ -60,27 +73,68 @@ impl PublishedConcurrentRead {
             // Capture them privately rather than mutating the shared view.
             return self
                 .begin_read_transaction()?
-                .query_sql_with_prepared_params(sql_text, parameters, prepared);
+                .query_sql_with_prepared_request(request, prepared);
         }
         // SQL execution borrows its store. The caller's publication Arc keeps
         // the complete schema/data view and generation pin alive, so ordinary
         // reads need neither a second store snapshot nor observation copies.
         self.snapshot
             .0
-            .query_sql_with_prepared_params(sql_text, parameters, prepared)
+            .query_sql_with_prepared_request(request, prepared)
     }
 
-    pub(super) fn prepare(
+    pub(crate) fn accepts_prepared(&self, prepared: &PreparedRuntimeQuery) -> bool {
+        self.snapshot.accepts_prepared(prepared)
+    }
+
+    pub(crate) fn prepare(&self, request: crate::QueryRequest<'_>) -> Result<PreparedRuntimeQuery> {
+        self.snapshot
+            .prepare_runtime_request(request, &self.plan_cache)
+    }
+
+    pub(crate) fn query_prepared_with_trace(
         &self,
-        cypher_text: String,
-        parameters: &BTreeMap<String, Value>,
-    ) -> Result<PreparedRuntimeQuery> {
-        self.snapshot.prepare_runtime_query(
-            cypher_text,
-            parameters,
-            &self.system_variables,
-            &self.plan_cache,
-        )
+        prepared: PreparedRuntimeQuery,
+        request: crate::QueryRequest<'_>,
+        capture_trace: bool,
+        external: &mut dyn crate::executor::ExternalReadOperator,
+    ) -> Result<(QueryOutput, super::super::QueryExecutionTrace)> {
+        let started = hawdb_core::time::Instant::now();
+        let statement_kind = prepared.statement_kind();
+        let parse_nanos = prepared.parse_nanos();
+        let result = (|| {
+            let mut read = match request.task_context {
+                Some(context) => self.begin_read_transaction_with_context(context)?,
+                None => self.begin_read_transaction()?,
+            };
+            read.query_prepared_request_traced(prepared, request, capture_trace, external)
+        })();
+        self.recorder.record_statement_execution(
+            "cypher",
+            request.cypher,
+            statement_kind,
+            started,
+            result.as_ref().map(|(output, _)| output),
+            super::super::StatementExecutionContext {
+                execution_profile: result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, trace)| trace.execution_profile.as_ref()),
+                retained_profile: None,
+                access_control: request.access_control,
+                parse_nanos,
+            },
+        );
+        result
+    }
+}
+
+impl std::fmt::Debug for PublishedConcurrentRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishedConcurrentRead")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
     }
 }
 

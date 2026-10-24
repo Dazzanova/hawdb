@@ -19,8 +19,8 @@ use super::{
 use crate::error::{HawDBError, Result};
 use crate::executor;
 use crate::relational_sql::{
-    compile_append_statement_sql, compile_prepared_append_explain_sql,
-    compile_prepared_append_select_sql, compile_relational_statement_sql_with_result,
+    compile_prepared_append_explain_sql, compile_prepared_append_select_sql,
+    compile_prepared_append_statement_sql, compile_prepared_relational_statement_with_result,
     format_append_explain, project_append_rows,
 };
 use crate::sql::{
@@ -94,6 +94,7 @@ pub(super) fn admit_append_explain(
 
 // A snapshot read can finish recording after releasing the commit sequencer.
 // Only the existing bounded observation containers and configured sink are shared.
+#[derive(Clone)]
 pub(super) struct StatementRecorder {
     slow_query_log: Arc<SharedState<system_sql::SlowQueryLog>>,
     statement_summary: Arc<SharedState<system_sql::StatementSummary>>,
@@ -410,21 +411,47 @@ impl Database {
         options: QueryStreamOptions,
         system_variables: super::QuerySystemVariables,
     ) -> Result<QueryOutput> {
+        self.query_sql_request_with_system_variables(
+            super::SqlQueryRequest::new(sql_text)
+                .with_params(parameters)
+                .with_output_limits(options),
+            system_variables,
+        )
+    }
+
+    pub fn query_sql_request(
+        &mut self,
+        request: super::SqlQueryRequest<'_>,
+    ) -> Result<QueryOutput> {
+        self.query_sql_request_with_system_variables(request, self.system_variables.clone())
+    }
+
+    fn query_sql_request_with_system_variables(
+        &mut self,
+        request: super::SqlQueryRequest<'_>,
+        system_variables: super::QuerySystemVariables,
+    ) -> Result<QueryOutput> {
+        super::query_runtime::query_runtime_checkpoint(request.task_context)?;
+        let sql_text = request.sql;
+        let parameters = request.parameters;
         if let Some(runtime) = self.runtime.peek() {
             runtime.store.ensure_usable()?;
         }
         let started = hawdb_core::time::Instant::now();
-        let max_rows =
-            super::restrictive_query_limit(self.config.read_result_row_limit(), options.max_rows);
-        let max_payload_bytes = super::restrictive_query_limit(
-            self.config.max_read_result_payload_bytes,
-            options.max_payload_bytes,
-        );
-        // Lifecycle/catalog statements need only project metadata. Parse them
-        // before touching the selected runtime's data or plan caches.
-        if let SqlStatement::Branch(statement) = crate::sql::parse_postgres_sql(sql_text)? {
+        let QueryStreamOptions {
+            max_rows,
+            max_payload_bytes,
+        } = request.effective_output_limits(&self.config);
+        // Lifecycle/catalog statements need only project metadata. Preparing a
+        // template must not open the selected runtime or pin its source.
+        let prepared = match self.runtime.peek() {
+            Some(runtime) => runtime.relational_plan_template_cache.prepare(sql_text)?,
+            None => crate::relational_sql::RelationalPlanTemplateCache::new(Some(0))
+                .prepare(sql_text)?,
+        };
+        if let SqlStatement::Branch(statement) = prepared.statement() {
             let result =
-                self.execute_branch_sql(&statement, parameters, max_rows, max_payload_bytes);
+                self.execute_branch_sql(statement, parameters, max_rows, max_payload_bytes);
             self.record_statement_execution(
                 "sql",
                 sql_text,
@@ -436,62 +463,52 @@ impl Database {
             return result;
         }
         self.runtime.get()?.store.ensure_usable()?;
-        let prepared = self
-            .runtime
-            .get()?
-            .relational_plan_template_cache
-            .prepare(sql_text)?;
-        self.query_sql_with_prepared_params_inner(
-            sql_text,
-            parameters,
-            prepared,
-            QueryStreamOptions {
+        self.query_sql_with_prepared_request_inner(
+            request.with_output_limits(QueryStreamOptions {
                 max_rows,
                 max_payload_bytes,
-            },
+            }),
+            prepared,
             started,
             system_variables,
         )
     }
 
-    pub(super) fn query_sql_with_prepared_params(
+    pub(crate) fn query_sql_with_prepared_request(
         &mut self,
-        sql_text: &str,
-        parameters: &[Value],
+        request: super::SqlQueryRequest<'_>,
         prepared: crate::relational_sql::PreparedRelationalSql,
     ) -> Result<QueryOutput> {
+        super::query_runtime::query_runtime_checkpoint(request.task_context)?;
         if let Some(runtime) = self.runtime.peek() {
             runtime.store.ensure_usable()?;
         }
-        let started = hawdb_core::time::Instant::now();
-        self.query_sql_with_prepared_params_inner(
-            sql_text,
-            parameters,
+        let options = request.effective_output_limits(&self.config);
+        self.query_sql_with_prepared_request_inner(
+            request.with_output_limits(options),
             prepared,
-            QueryStreamOptions {
-                max_rows: self.config.read_result_row_limit(),
-                max_payload_bytes: self.config.max_read_result_payload_bytes,
-            },
-            started,
+            hawdb_core::time::Instant::now(),
             self.system_variables.clone(),
         )
     }
 
-    fn query_sql_with_prepared_params_inner(
+    fn query_sql_with_prepared_request_inner(
         &mut self,
-        sql_text: &str,
-        parameters: &[Value],
+        request: super::SqlQueryRequest<'_>,
         prepared: crate::relational_sql::PreparedRelationalSql,
-        options: QueryStreamOptions,
         started: hawdb_core::time::Instant,
         system_variables: super::QuerySystemVariables,
     ) -> Result<QueryOutput> {
+        let sql_text = request.sql;
+        let parameters = request.parameters;
+        let task_context = request.task_context;
         let QueryStreamOptions {
             max_rows,
             max_payload_bytes,
-        } = options;
+        } = request.output_limits;
         let statement_kind = sql_statement_kind(prepared.statement());
         let query_result = (|| {
+            super::query_runtime::query_runtime_checkpoint(task_context)?;
             if let SqlStatement::Branch(statement) = prepared.statement() {
                 return self.execute_branch_sql(statement, parameters, max_rows, max_payload_bytes);
             }
@@ -548,6 +565,7 @@ impl Database {
                 // Validate result-bearing DML before publication, regardless
                 // of whether a ceiling exists.
                 let mut transaction = self.begin_transaction()?;
+                transaction.task_context = task_context.cloned();
                 transaction.runtime.system_variables = system_variables;
                 transaction.runtime.config.max_read_result_rows = max_rows;
                 transaction.runtime.config.max_read_result_payload_bytes = max_payload_bytes;
@@ -560,7 +578,9 @@ impl Database {
                     super::DatabaseTransactionSqlOptions {
                         allow_system_schema_registry_write: false,
                         allow_locking_select: false,
-                        task_context: None,
+                        task_context,
+                        output_limits: request.output_limits,
+                        join_planning: request.join_planning,
                     },
                 )?;
                 // Explicit request Some(0) remains strict, unlike host Some(0).
@@ -660,7 +680,7 @@ impl Database {
                         max_rows,
                         max_payload_bytes,
                     },
-                    None,
+                    task_context,
                 );
             }
 
@@ -689,8 +709,9 @@ impl Database {
                             &self.config,
                             max_rows,
                             max_payload_bytes,
-                            None,
-                        ),
+                            task_context,
+                        )
+                        .with_join_planning(request.join_planning),
                     );
                 self.runtime
                     .get()?
@@ -700,9 +721,10 @@ impl Database {
                 return Ok(QueryOutput { rows: output.rows });
             }
 
+            super::query_runtime::query_runtime_checkpoint(task_context)?;
             self.ensure_writable()?;
-            let transaction = compile_append_statement_sql(
-                sql_text,
+            let transaction = compile_prepared_append_statement_sql(
+                &prepared.template,
                 parameters,
                 self.runtime.get()?.store.append_state(),
             )?;
@@ -722,6 +744,7 @@ impl Database {
                     )));
                 }
                 let summary = {
+                    super::query_runtime::query_runtime_checkpoint(task_context)?;
                     let mut branch_runtime_access = self.runtime.get_mut()?;
                     let branch_runtime = &mut *branch_runtime_access;
                     branch_runtime.store.commit_kernel_write_batch(
@@ -750,12 +773,13 @@ impl Database {
                     create.table.name
                 )));
             }
-            let compiled = compile_relational_statement_sql_with_result(
-                sql_text,
+            let compiled = compile_prepared_relational_statement_with_result(
+                &prepared.template,
                 parameters,
                 self.runtime.get()?.store.relational_state(),
             )?;
             let summary = {
+                super::query_runtime::query_runtime_checkpoint(task_context)?;
                 let mut branch_runtime_access = self.runtime.get_mut()?;
                 let branch_runtime = &mut *branch_runtime_access;
                 branch_runtime.store.commit_relational_transaction(
