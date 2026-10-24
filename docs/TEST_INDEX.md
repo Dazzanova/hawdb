@@ -300,6 +300,14 @@ relationship to an out-of-scope label whose post-E mutation must invalidate
 publication. Storage units check immutable reservation predecessors, missing
 registration policy, and direct history pruning without staging compaction.
 
+## Windows native contract ownership
+
+The native workflow runs seven independent Bazel shards and a separate strict
+Cargo Clippy job. The original `Windows native contracts` check requires every
+result to pass. See [Windows native CI](WINDOWS_NATIVE_CI.md) for the complete
+selection/profile/count matrix, cache policy, cold-build costs and local replay.
+The daily/manual abandonment lane remains separate and requires eight passing
+cases with the selected 1/2/4/8-thread setting. No fuzz campaign is added.
 
 ## Strict append preparation
 
@@ -319,3 +327,33 @@ registration policy, and direct history pruning without staging compaction.
   scheduled registration. See [workload, results and limits](STRICT_APPEND_PREPARE_BENCHMARK.md).
   These are preparation timings without WAL synchronization, not committed
   throughput or durable p99 measurements.
+
+## License hook and subprocess lease handshake
+
+- `scripts/check-license-headers.test.py` is a local pinned-HawkEye fixture
+  check for full/SPDX forms, Python/Shell shebangs, excluded/unsupported files,
+  mixed valid/invalid batches, wrong owners/licenses and byte preservation.
+  The staged-file hook uses the same HawkEye rules for both header templates.
+- `//crates/storage:hawdb_storage_tests` owns the cross-process directory lease
+  case `ownership::tests::rejects_lease_held_by_another_process`. The child keeps
+  the lease until a parent pipe notification, avoiding its former ten-second
+  self-expiry under CPU contention. Parent exit closes the pipe; the ordinary
+  finite test deadline remains the outer bound. Native Cargo/Windows ownership
+  lanes retain the same exclusion assertion.
+
+## Native Go shared-library runfiles
+
+`//bindings/go:hawdb_go_tests` resolves the single runtime file exposed by
+`//bindings/ffi:hawdb_ffi_runtime`. The projection reuses the existing Rust
+cdylib output and preserves its runtime runfiles; it creates no compilation or
+copy action. The original `//bindings/ffi:hawdb_ffi` still provides the complete
+linker outputs, including the Windows `.dll.lib` import library. Passing that
+multi-file target to `rlocationpath` fails Windows analysis before Go executes.
+Existing Go TestMain resolves the path through the runfiles API (including
+Windows manifests) and actual bindings tests exercise dynamic loading on all
+three native CI platforms. Windows uses the bindings feature profile and fresh
+Go test results; the Unix native binding jobs retain their existing profile.
+
+The native feature inventory audit also requires the independent telemetry
+Bazel spec and lock to match the workspace Cargo.lock package version, source
+and checksum. Update them together when upgrading the optional dependency.
