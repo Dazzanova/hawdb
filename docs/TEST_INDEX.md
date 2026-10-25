@@ -279,6 +279,30 @@ the cumulative snapshot ledger; ordinary reads keep their 8 KiB snapshot cap.
 
 ## Root regression owners
 
+Namespace durability anchors use the existing storage descriptor tests,
+`branch_project_open` integration target and root power-loss family. Storage
+cases cover bounded inclusive barriers, unchanged default ancestry, failed
+barrier retry/accounting, pre-effect validation, canonical aliases, symlink
+escape and live-owner configuration conflicts. Detached producer scratch keeps
+the initiating project's descriptor accounting while retaining its complete
+ancestor walk, including failed-barrier propagation. The Windows descriptor case
+uses a fresh thread with a restricted token, removing administrator-group
+authority and privileges without changing machine ACLs. It opens and reopens a
+private project beneath the OS-owned temp directory. The embedded facade case
+round-trips graph and SQL writes. The anchored initial-installation recorder
+reuses the complete before/after mkdir, lost-write and committed mixed-transaction
+oracles of the default installation case. These cases add no CI job or profile;
+the native Windows storage descriptor lane discovers the restricted-token case.
+Local replay filters are `namespace_anchor` (storage) and
+`namespace_durability_anchor` (facade integration and power-loss owners).
+The recorder requires the root `test-support` feature; the ordinary default
+unit executable does not contain it. Replay it with
+`bazel test //:hawdb_unit_test_binary --//:windows_native_profile=facade_all --test_arg=namespace_durability_anchor`
+or `cargo test --locked -p hawdb --all-features --lib namespace_durability_anchor`.
+Its existing full-feature qualification owner is the branch power-loss
+workflow's `remaining` partition; the native Windows storage shard separately
+owns the restricted-token descriptor case.
+
 | Target / family | What it detects | Notes |
 | --- | --- | --- |
 | `//:hawdb_manual_checkpoint_tests`, `//:hawdb_manual_checkpoint_minimal_tests` | Explicit ordinary/concurrent/embedded checkpoints preserve durable publication independently of background support/admission. Embedded controls retain one same-governor background or foreground I/O permit, distinguish allowed foreground work from legitimate refusal, and check reopen and refunds. | Existing default/minimal public-consumer carriers and profiles; replay `cargo test --locked --test manual_checkpoint`, adding `--no-default-features` for minimal. The existing root automatic-checkpoint `publication_io` family also pauses the actual owner with its acquired wave, observes manual suspension, and checks durable completion/refunds under [#1219](https://github.com/nowledge-co/hawdb/issues/1219). |
